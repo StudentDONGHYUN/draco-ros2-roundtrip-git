@@ -1,0 +1,49 @@
+# HDL Graph SLAM configuration for streaming point clouds
+# source: adapted from koide3/hdl_graph_slam (ROS2)
+
+# input topic
+points_topic: /stream_pair/decoded
+# optional IMU/odom topics (if available)
+imu_topic: ""
+odom_topic: ""
+
+# Frames
+base_frame_id: lidar_link
+odom_frame_id: odom
+map_frame_id: map
+
+# keyframe parameters
+keyframe_delta_trans: 0.5
+keyframe_delta_angle: 0.2
+keyframe_delta_time: 1.0
+
+# voxel filter
+downsample_method: VoxelGrid
+voxel_leaf_size: 0.2
+
+registration:
+  type: NDTOMP
+  ndt_resolution: 1.0
+  ndt_step_size: 0.1
+  ndt_num_threads: 2
+  small_voxel_radius: 0.2
+  large_voxel_radius: 0.8
+  small_voxel_resolution: 0.2
+  large_voxel_resolution: 0.8
+
+use_reflectance: false
+
+# loop detection
+loop_search_num_targets: 50
+loop_detection_period: 2.0
+loop_distance_threshold: 5.0
+loop_angle_threshold: 0.2
+loop_gravity_align: false
+
+# map publisher
+publish_tf: true
+map_publish_period: 1.0
+
+# map saving
+map_cloud_path: map_stream.pcd
+

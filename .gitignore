@@ -1,0 +1,26 @@
+# Ignore large data artifacts and backups
+backup_pre_cleanup_*.tar.gz
+*.tar.gz
+
+# Runtime outputs and logs
+logs/
+ros2_ws/log/
+
+# Datasets/results that don't belong in git
+data/bags/
+data/bags_keep/
+data/results/
+
+# Legacy project artifacts
+.draco-ros2-roundtrip/logs/
+draco-ros2-roundtrip/logs/
+draco-ros2-roundtrip/data/bags/
+draco-ros2-roundtrip/data/results/
+draco-ros2-roundtrip/pcd_diff.log
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local helper files
+README.md.keep
