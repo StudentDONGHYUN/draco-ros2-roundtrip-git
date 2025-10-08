@@ -75,7 +75,8 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"[SERVER] Ignoring unexpected message kind: {msg.kind}")
                     continue
                 stem_raw = msg.name or "frame"
-                stem = Path(stem_raw).stem
+                base_stem, _, _frame_meta = stem_raw.partition('|')
+                stem = Path(base_stem).stem
                 bytes_in += len(msg.payload)
                 print(f"[SERVER] Received {stem_raw} ({len(msg.payload)} bytes)")
                 try:
