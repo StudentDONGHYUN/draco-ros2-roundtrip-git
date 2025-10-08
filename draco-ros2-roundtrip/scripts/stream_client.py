@@ -299,7 +299,8 @@ def ply_stream_reader(pipe: socket.socket,
                 name_b = fh.read(name_len)
                 if len(name_b) < name_len:
                     raise ConnectionError("Stream closed while reading name")
-                name = name_b.decode('utf-8')
+                raw_name = name_b.decode('utf-8')
+                name = raw_name.split('|', 1)[0]
                 size_bytes = fh.read(8)
                 if len(size_bytes) < 8:
                     raise ConnectionError("Stream closed while reading payload size")

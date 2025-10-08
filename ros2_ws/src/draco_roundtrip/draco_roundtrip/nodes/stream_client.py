@@ -26,6 +26,8 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Header
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import StaticTransformBroadcaster
 
 from draco_roundtrip.utils import (
     Message,
@@ -200,6 +202,7 @@ class FrameJob:
     name: str
     ply_bytes: bytes
     src_points: np.ndarray
+    frame_id: str
 
 
 @dataclass
@@ -208,10 +211,13 @@ class FrameContext:
     name: str
     ply_bytes: bytes
     src_points: np.ndarray
+    frame_id: str
 
 
 class PlaybackNode(Node):
-    def __init__(self, queue_obj: queue.Queue, frame_id: str, topic_prefix: str, hz: float):
+    def __init__(self, queue_obj: queue.Queue, default_frame_id: str,
+                 topic_prefix: str, hz: float, tf_parent: str,
+                 broadcast_tf: bool):
         super().__init__('stream_playback')
         qos = QoSProfile(depth=1)
         qos.history = HistoryPolicy.KEEP_LAST
@@ -219,7 +225,11 @@ class PlaybackNode(Node):
         self.pub_src = self.create_publisher(PointCloud2, f"/{topic_prefix}/source", qos)
         self.pub_dec = self.create_publisher(PointCloud2, f"/{topic_prefix}/decoded", qos)
         self.queue = queue_obj
-        self.frame_id = frame_id
+        self.default_frame_id = default_frame_id
+        self.tf_parent = tf_parent
+        self.broadcast_tf = broadcast_tf
+        self.tf_broadcaster = StaticTransformBroadcaster(self) if broadcast_tf else None
+        self.broadcasted_frames: set[str] = set()
         self.period = 1.0 / hz if hz > 0 else 0.01
         self.timer = self.create_timer(self.period, self._tick)
 
@@ -232,21 +242,42 @@ class PlaybackNode(Node):
             self.get_logger().info("Playback finished")
             rclpy.shutdown()
             return
-        frame_idx, name, pts_src, pts_dec = item
+        frame_idx, name, frame_id, pts_src, pts_dec = item
+        frame_id = frame_id or self.default_frame_id
+        if not frame_id:
+            frame_id = self.tf_parent
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.frame_id
+        header.frame_id = frame_id
         msg_src = pc2.create_cloud_xyz32(header, pts_src)
         msg_dec = pc2.create_cloud_xyz32(header, pts_dec)
         self.pub_src.publish(msg_src)
         self.pub_dec.publish(msg_dec)
+        if (self.broadcast_tf and self.tf_broadcaster and frame_id not in self.broadcasted_frames
+                and frame_id != self.tf_parent):
+            transform = TransformStamped()
+            transform.header.stamp = header.stamp
+            transform.header.frame_id = self.tf_parent
+            transform.child_frame_id = frame_id
+            transform.transform.translation.x = 0.0
+            transform.transform.translation.y = 0.0
+            transform.transform.translation.z = 0.0
+            transform.transform.rotation.w = 1.0
+            transform.transform.rotation.x = 0.0
+            transform.transform.rotation.y = 0.0
+            transform.transform.rotation.z = 0.0
+            self.tf_broadcaster.sendTransform(transform)
+            self.broadcasted_frames.add(frame_id)
         self.get_logger().debug(f"Published frame {frame_idx}: {name}")
 
 
-def start_playback_thread(queue_obj: queue.Queue, frame_id: str, topic_prefix: str, hz: float) -> threading.Thread:
+def start_playback_thread(queue_obj: queue.Queue, default_frame_id: str,
+                          topic_prefix: str, hz: float,
+                          tf_parent: str, broadcast_tf: bool) -> threading.Thread:
     def _run():
         rclpy.init()
-        node = PlaybackNode(queue_obj, frame_id, topic_prefix, hz)
+        node = PlaybackNode(queue_obj, default_frame_id, topic_prefix, hz,
+                             tf_parent=tf_parent, broadcast_tf=broadcast_tf)
         try:
             rclpy.spin(node)
         except KeyboardInterrupt:
@@ -325,6 +356,7 @@ def sender_loop(sock: socket.socket,
                             name=pending_job.name,
                             ply_bytes=pending_job.ply_bytes,
                             src_points=pending_job.src_points,
+                            frame_id=pending_job.frame_id,
                         )
                     print(f"[CLIENT] Sent {pending_name} ({len(pending_payload)} bytes)")
                     next_seq += 1
@@ -347,7 +379,8 @@ def sender_loop(sock: socket.socket,
             stem = name.split('.', 1)[0]
             with context_lock:
                 context_store[stem] = FrameContext(seq=job.seq, name=job.name,
-                                                   ply_bytes=job.ply_bytes, src_points=job.src_points)
+                                                   ply_bytes=job.ply_bytes, src_points=job.src_points,
+                                                   frame_id=job.frame_id)
             print(f"[CLIENT] Sent {name} ({len(payload)} bytes)")
             next_seq += 1
 
@@ -423,14 +456,15 @@ def receiver_loop(sock: socket.socket,
             f"x={bbox_delta[0]:+.3f}  y={bbox_delta[1]:+.3f}  z={bbox_delta[2]:+.3f}"
         )
         print(f"  mean|max dist (m): {mean_str}/{max_str}")
-        play_queue.put((frame_idx, ctx.name.split('.', 1)[0], ctx.src_points.astype(np.float32), dec_pts.astype(np.float32)))
+        play_queue.put((frame_idx, ctx.name.split('.', 1)[0], ctx.frame_id, ctx.src_points.astype(np.float32), dec_pts.astype(np.float32)))
         print(f"[CLIENT] Received {name} ({len(payload)} bytes)")
 
 
 def ply_stream_reader(pipe: socket.socket,
                       encode_queue: "queue.Queue[Optional[FrameJob]]",
                       stop_event: threading.Event,
-                      error_queue: "queue.Queue[Exception]") -> None:
+                      error_queue: "queue.Queue[Exception]",
+                      default_frame_id: str) -> None:
     seq = 0
     try:
         with pipe, pipe.makefile('rb') as fh:
@@ -446,7 +480,12 @@ def ply_stream_reader(pipe: socket.socket,
                 name_b = fh.read(name_len)
                 if len(name_b) < name_len:
                     raise ConnectionError("Stream closed while reading name")
-                name = name_b.decode('utf-8')
+                raw_name = name_b.decode('utf-8')
+                base_name, sep, frame_meta = raw_name.partition('|')
+                frame_id = frame_meta if sep else default_frame_id
+                if not frame_id:
+                    frame_id = default_frame_id
+                name = base_name
                 size_bytes = fh.read(8)
                 if len(size_bytes) < 8:
                     raise ConnectionError("Stream closed while reading payload size")
@@ -465,7 +504,8 @@ def ply_stream_reader(pipe: socket.socket,
                     error_queue.put(exc)
                     stop_event.set()
                     return
-                encode_queue.put(FrameJob(seq=seq, name=name, ply_bytes=bytes(payload), src_points=src_pts))
+                encode_queue.put(FrameJob(seq=seq, name=name, ply_bytes=bytes(payload),
+                                           src_points=src_pts, frame_id=frame_id))
                 seq += 1
     except Exception as exc:
         if not stop_event.is_set():
@@ -519,6 +559,10 @@ def main(argv: Iterable[str] | None = None) -> None:
     ap.add_argument('--play-topic-prefix', default='stream_pair')
     ap.add_argument('--play-hz', type=float, default=10.0)
     ap.add_argument('--play-sample', type=int, default=50000)
+    ap.add_argument('--tf-parent-frame', default='map',
+                    help="Parent frame used when broadcasting static TF for streamed clouds")
+    ap.add_argument('--no-tf', action='store_true',
+                    help="Disable automatic TF broadcasting for streamed frames")
     ap.add_argument('--encoder-workers', type=int, default=0,
                     help="Parallel Draco encoder workers (0 = auto)")
     ap.add_argument('--max-pending', type=int, default=16,
@@ -584,14 +628,21 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     stream_thread = threading.Thread(
         target=ply_stream_reader,
-        args=(stream_parent, encode_queue, stop_event, error_queue),
+        args=(stream_parent, encode_queue, stop_event, error_queue, args.play_frame_id),
         name="ply-stream",
         daemon=True,
     )
     stream_thread.start()
 
     to_play: queue.Queue = queue.Queue()
-    playback_thread = start_playback_thread(to_play, args.play_frame_id, args.play_topic_prefix, args.play_hz)
+    playback_thread = start_playback_thread(
+        to_play,
+        args.play_frame_id,
+        args.play_topic_prefix,
+        args.play_hz,
+        args.tf_parent_frame,
+        not args.no_tf,
+    )
     decoded_files: set[Path] = set()
 
     start_time = time.monotonic()

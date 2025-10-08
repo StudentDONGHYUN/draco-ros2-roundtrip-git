@@ -253,11 +253,13 @@ class PcdSaver(Node):
                 return
 
         name = f"{self.prefix}_{self.idx:0{PAD}d}.ply"
+        frame_id = msg.header.frame_id if hasattr(msg, "header") else ""
 
         if self.stream_emitter is not None:
             payload = xyz_to_ply_bytes(xyz)
             try:
-                self.stream_emitter.send(name, payload)
+                meta_name = f"{name}|{frame_id}" if frame_id else name
+                self.stream_emitter.send(meta_name, payload)
             except BrokenPipeError:
                 self.get_logger().error("Stream pipe closed. Shutting down.")
                 rclpy.shutdown()
