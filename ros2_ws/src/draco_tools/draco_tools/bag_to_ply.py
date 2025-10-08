@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROS2 PointCloud2 -> PLY 저장 노드 (Open3D 우선 + plyfile 폴백)
+ROS2 PointCloud2 -> PLY 저장 노드 (스트림 모드 지원)
 - QoS: Reliable/Best Effort
 - --every N, --max-frames, --idle-timeout-sec 지원
 - PointCloud2 → (N,3) float32 변환 경로를 견고하게 수정(read_points_numpy 우선)
+- --stream-fd 로 length-prefix 바이너리 스트림으로 직접 전송 가능
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
+import io
+import os
 import re
+import struct
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 
@@ -89,6 +96,48 @@ def voxel_downsample(xyz: np.ndarray, voxel_size: float) -> np.ndarray:
     return xyz[idx]
 
 
+def xyz_to_ply_bytes(xyz_f32: np.ndarray) -> bytes:
+    """PLY 바이너리를 BytesIO로 생성."""
+    verts = np.zeros(xyz_f32.shape[0], dtype=[('x', '<f4'), ('y', '<f4'), ('z', '<f4')])
+    verts['x'] = xyz_f32[:, 0]
+    verts['y'] = xyz_f32[:, 1]
+    verts['z'] = xyz_f32[:, 2]
+    el = PlyElement.describe(verts, 'vertex')
+    ply = PlyData([el], text=False)
+    buf = io.BytesIO()
+    ply.write(buf)
+    return buf.getvalue()
+
+
+class StreamEmitter:
+    """길이-프리픽스 메시지로 PLY 스트림을 내보낸다."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        # buffering=0으로 즉시 전송. fd는 부모가 pass_fds로 넘김.
+        self._fh = os.fdopen(fd, 'wb', buffering=0)
+
+    def send(self, name: str, payload: bytes) -> None:
+        name_b = name.encode('utf-8')
+        header = struct.pack('!I', len(name_b))
+        size = struct.pack('!Q', len(payload))
+        self._fh.write(header)
+        self._fh.write(name_b)
+        self._fh.write(size)
+        self._fh.write(payload)
+
+    def close(self) -> None:
+        try:
+            # 종료 신호로 name_len=0을 보낸다.
+            self._fh.write(struct.pack('!I', 0))
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
 def save_ply_plyfile(path: Path, xyz_f32: np.ndarray) -> None:
     """plyfile로 float32 보장 저장"""
     verts = np.zeros(xyz_f32.shape[0], dtype=[('x', '<f4'), ('y', '<f4'), ('z', '<f4')])
@@ -131,7 +180,7 @@ class PcdSaver(Node):
     def __init__(self, topic: str, out_dir: Path, prefix: str,
                  every: int, qos_reliable: bool, max_frames: int,
                  idle_timeout_sec: float, log_csv: Path | None,
-                 voxel_size: float):
+                 voxel_size: float, stream_emitter: Optional[StreamEmitter]):
         super().__init__('ply_saver')
 
         self.topic = topic
@@ -141,8 +190,10 @@ class PcdSaver(Node):
         self.max_frames = max_frames  # 0이면 무제한
         self.idle_timeout_sec = float(idle_timeout_sec)
         self.voxel_size = float(max(0.0, voxel_size))
+        self.stream_emitter = stream_emitter
 
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        if self.stream_emitter is None:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
 
         qos = QoSProfile(depth=10)
         qos.history = HistoryPolicy.KEEP_LAST
@@ -202,14 +253,26 @@ class PcdSaver(Node):
                 return
 
         name = f"{self.prefix}_{self.idx:0{PAD}d}.ply"
-        path = self.out_dir / name
 
-        save_ply_o3d_then_verify(path, xyz)
+        if self.stream_emitter is not None:
+            payload = xyz_to_ply_bytes(xyz)
+            try:
+                self.stream_emitter.send(name, payload)
+            except BrokenPipeError:
+                self.get_logger().error("Stream pipe closed. Shutting down.")
+                rclpy.shutdown()
+                return
+            path = self.out_dir / name if self.out_dir else Path(name)
+            msg = f"Streamed {name}"
+        else:
+            path = self.out_dir / name
+            save_ply_o3d_then_verify(path, xyz)
+            msg = f"Saved {path}"
 
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.saved += 1
         self.idx += 1
-        self.get_logger().info(f"Saved {path} ({xyz.shape[0]} pts) in {dt_ms:.1f} ms")
+        self.get_logger().info(f"{msg} ({xyz.shape[0]} pts) in {dt_ms:.1f} ms")
 
         if self._log_writer and self._log_fp:
             try:
@@ -224,7 +287,7 @@ class PcdSaver(Node):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="PointCloud2 -> PLY saver (Open3D 우선+plyfile 폴백)")
+    ap = argparse.ArgumentParser(description="PointCloud2 -> PLY saver (스트림/파일)")
     ap.add_argument("--topic", required=True, help="구독할 PointCloud2 토픽")
     ap.add_argument("--out", required=True, help="PLY 저장 디렉토리")
     ap.add_argument("--prefix", default="sample", help="파일 접두어")
@@ -238,10 +301,13 @@ def main():
     ap.add_argument("--voxel-size", type=float, default=0.0,
                     help=">0이면 저장 전 voxel downsample 적용 (m)")
     ap.add_argument("--log-csv", default=None, help="프레임 저장 시간 로그 CSV")
+    ap.add_argument("--stream-fd", type=int, default=None,
+                    help="지정 시 length-prefix 바이너리 스트림으로 PLY 전송")
     args = ap.parse_args()
 
     out_dir = Path(args.out).expanduser().resolve()
     log_csv = Path(args.log_csv).expanduser().resolve() if args.log_csv else None
+    stream_emitter = StreamEmitter(args.stream_fd) if args.stream_fd is not None else None
 
     rclpy.init(args=None)
     node = PcdSaver(
@@ -254,6 +320,7 @@ def main():
         idle_timeout_sec=args.idle_timeout_sec,
         log_csv=log_csv,
         voxel_size=float(args.voxel_size),
+        stream_emitter=stream_emitter,
     )
     try:
         rclpy.spin(node)
@@ -266,6 +333,11 @@ def main():
             rclpy.try_shutdown()
         except Exception:
             pass
+        if stream_emitter is not None:
+            try:
+                stream_emitter.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""Stream rosbag frames, encode/send to server, replay decoded results to RViz."""
+"""Stream rosbag frames through Draco encode/transfer with live playback."""
 
 from __future__ import annotations
 
 import argparse
 import io
+import os
 import queue
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Set, Tuple
-
-try:
-    from ament_index_python.packages import get_package_share_directory
-except ImportError:  # pragma: no cover - during setup or if ament not available
-    get_package_share_directory = None  # type: ignore
+from typing import Dict, Iterable, Optional
 
 import numpy as np
 import rclpy
@@ -29,10 +28,9 @@ from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Header
 
 try:
-    import open3d as o3d  # type: ignore
-    _HAVE_O3D = True
-except Exception:  # pragma: no cover - optional dep
-    _HAVE_O3D = False
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:  # pragma: no cover - during setup or if ament not available
+    get_package_share_directory = None  # type: ignore
 
 try:
     from plyfile import PlyData
@@ -96,15 +94,15 @@ def recv_message(sock: socket.socket) -> Optional[tuple[str, bytes]]:
         return None
     name = sock.recv(name_len).decode('utf-8')
     size = struct.unpack('!Q', sock.recv(8))[0]
-    payload = bytearray()
+    payload = b''
     remaining = size
     while remaining:
         chunk = sock.recv(min(65536, remaining))
         if not chunk:
             raise ConnectionError("connection closed prematurely")
-        payload.extend(chunk)
+        payload += chunk
         remaining -= len(chunk)
-    return name, bytes(payload)
+    return name, payload
 
 
 def encode_ply(encoder: Path, ply_path: Path, out_dir: Path,
@@ -118,27 +116,62 @@ def encode_ply(encoder: Path, ply_path: Path, out_dir: Path,
     rc = subprocess.run(cmd, capture_output=True, text=True)
     if rc.returncode != 0:
         raise RuntimeError(f"draco_encoder failed: {rc.stderr.strip()}\n{rc.stdout.strip()}")
-    return drc_path.read_bytes()
+    data = drc_path.read_bytes()
+    with suppress(FileNotFoundError):
+        drc_path.unlink()
+    return data
 
 
-def load_points_from_path(path: Path) -> np.ndarray:
-    if _HAVE_O3D:
-        pcd = o3d.io.read_point_cloud(str(path))
-        return np.asarray(pcd.points, dtype=np.float32)
-    ply = PlyData.read(str(path))
-    verts = ply["vertex"]
-    arr = np.vstack((verts["x"], verts["y"], verts["z"]))
-    return arr.T.astype(np.float32)
+def encode_ply_bytes(encoder: Path,
+                     ply_name: str,
+                     ply_bytes: bytes,
+                     work_dir: Path,
+                     cl: int,
+                     qp: int,
+                     qg: int,
+                     extra: list[str]) -> bytes:
+    fd, tmp_path = tempfile.mkstemp(prefix=Path(ply_name).stem + '_', suffix='.ply', dir=str(work_dir))
+    try:
+        with os.fdopen(fd, 'wb') as tmp_file:
+            tmp_file.write(ply_bytes)
+        try:
+            return encode_ply(encoder, Path(tmp_path), work_dir, cl, qp, qg, extra)
+        finally:
+            with suppress(FileNotFoundError):
+                Path(tmp_path).unlink()
+    except Exception:
+        with suppress(FileNotFoundError):
+            Path(tmp_path).unlink()
+        raise
+
+
+class StreamingStats:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._bytes_sent = 0
+        self._bytes_received = 0
+
+    def add_sent(self, amount: int) -> None:
+        with self._lock:
+            self._bytes_sent += amount
+
+    def add_received(self, amount: int) -> None:
+        with self._lock:
+            self._bytes_received += amount
+
+    def snapshot(self) -> tuple[int, int]:
+        with self._lock:
+            return self._bytes_sent, self._bytes_received
 
 
 def load_points_from_bytes(data: bytes) -> np.ndarray:
     ply = PlyData.read(io.BytesIO(data))
-    verts = ply["vertex"]
-    arr = np.vstack((verts["x"], verts["y"], verts["z"]))
+    verts = ply['vertex']
+    arr = np.vstack((verts['x'], verts['y'], verts['z']))
     return arr.T.astype(np.float32)
 
 
-def compute_metrics(src_pts: np.ndarray, dec_pts: np.ndarray, sample: int) -> Tuple[int, int, int, np.ndarray, float, np.ndarray, str, str]:
+def compute_metrics(src_pts: np.ndarray, dec_pts: np.ndarray, sample: int) -> tuple[int, int, int, np.ndarray, float, np.ndarray, str, str]:
     n_src = len(src_pts)
     n_dec = len(dec_pts)
     diff = n_dec - n_src
@@ -180,19 +213,20 @@ def compute_metrics(src_pts: np.ndarray, dec_pts: np.ndarray, sample: int) -> Tu
     return n_src, n_dec, diff, centroid_delta, centroid_norm, bbox_delta, mean_str, max_str
 
 
-def launch_bag_to_ply(root: Path, args: argparse.Namespace) -> subprocess.Popen:
-    script = root / 'data' / 'bag_to_ply.py'
-    cmd = [sys.executable, str(script),
-           '--topic', args.topic,
-           '--out', str(Path(args.ply_dir).resolve()),
-           '--prefix', args.prefix,
-           '--idle-timeout-sec', str(args.idle_timeout),
-    ]
-    if args.best_effort:
-        cmd.append('--best-effort')
-    if args.max_frames:
-        cmd += ['--max-frames', str(args.max_frames)]
-    return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+@dataclass
+class FrameJob:
+    seq: int
+    name: str
+    ply_bytes: bytes
+    src_points: np.ndarray
+
+
+@dataclass
+class FrameContext:
+    seq: int
+    name: str
+    ply_bytes: bytes
+    src_points: np.ndarray
 
 
 class PlaybackNode(Node):
@@ -240,13 +274,240 @@ def start_playback_thread(queue_obj: queue.Queue, frame_id: str, topic_prefix: s
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
+
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     return t
 
 
+def encode_worker(_worker_id: int,
+                  encode_queue: "queue.Queue[Optional[FrameJob]]",
+                  send_queue: "queue.Queue[Optional[tuple[int, str, Optional[bytes], FrameJob]]]",
+                  encoder: Path,
+                  work_dir: Path,
+                  cl: int,
+                  qp: int,
+                  qg: int,
+                  extra: list[str],
+                  _stop_event: threading.Event) -> None:
+    while True:
+        job = encode_queue.get()
+        if job is None:
+            encode_queue.task_done()
+            break
+        try:
+            drc_bytes = encode_ply_bytes(encoder, job.name, job.ply_bytes, work_dir, cl, qp, qg, extra)
+            send_queue.put((job.seq, job.name, drc_bytes, job))
+        except Exception as exc:
+            print(f"[CLIENT] ENCODE FAIL {job.name}: {exc}")
+            send_queue.put((job.seq, job.name, None, job))
+        finally:
+            encode_queue.task_done()
+
+
+def sender_loop(sock: socket.socket,
+                send_queue: "queue.Queue[Optional[tuple[int, str, Optional[bytes], FrameJob]]]",
+                stats: StreamingStats,
+                stop_event: threading.Event,
+                error_queue: "queue.Queue[Exception]",
+                context_store: Dict[str, FrameContext],
+                context_lock: threading.Lock) -> None:
+    pending: Dict[int, tuple[str, Optional[bytes], FrameJob]] = {}
+    next_seq = 0
+    try:
+        while True:
+            if stop_event.is_set() and send_queue.empty() and not pending:
+                break
+            item = send_queue.get()
+            try:
+                if item is None:
+                    break
+                seq, name, payload, job = item
+                pending[seq] = (name, payload, job)
+                while next_seq in pending:
+                    pending_name, pending_payload, pending_job = pending.pop(next_seq)
+                    if pending_payload is None:
+                        next_seq += 1
+                        continue
+                    message_name = pending_name.replace('.ply', '.drc')
+                    try:
+                        send_message(sock, message_name, pending_payload)
+                    except Exception as exc:
+                        error_queue.put(exc)
+                        stop_event.set()
+                        return
+                    stats.add_sent(len(pending_payload))
+                    stem = pending_name.split('.', 1)[0]
+                    with context_lock:
+                        context_store[stem] = FrameContext(
+                            seq=pending_job.seq,
+                            name=pending_job.name,
+                            ply_bytes=pending_job.ply_bytes,
+                            src_points=pending_job.src_points,
+                        )
+                    print(f"[CLIENT] Sent {pending_name} ({len(pending_payload)} bytes)")
+                    next_seq += 1
+            finally:
+                send_queue.task_done()
+    finally:
+        while next_seq in pending and not stop_event.is_set():
+            name, payload, job = pending.pop(next_seq)
+            if payload is None:
+                next_seq += 1
+                continue
+            message_name = name.replace('.ply', '.drc')
+            try:
+                send_message(sock, message_name, payload)
+            except Exception as exc:
+                error_queue.put(exc)
+                stop_event.set()
+                return
+            stats.add_sent(len(payload))
+            stem = name.split('.', 1)[0]
+            with context_lock:
+                context_store[stem] = FrameContext(seq=job.seq, name=job.name,
+                                                   ply_bytes=job.ply_bytes, src_points=job.src_points)
+            print(f"[CLIENT] Sent {name} ({len(payload)} bytes)")
+            next_seq += 1
+
+
+def receiver_loop(sock: socket.socket,
+                  decoded_dir: Path,
+                  stats: StreamingStats,
+                  stop_event: threading.Event,
+                  error_queue: "queue.Queue[Exception]",
+                  context_store: Dict[str, FrameContext],
+                  context_lock: threading.Lock,
+                  play_queue: queue.Queue,
+                  play_sample: int) -> None:
+    frame_idx = 0
+    while not stop_event.is_set():
+        try:
+            reply = recv_message(sock)
+        except Exception as exc:
+            if not stop_event.is_set():
+                error_queue.put(exc)
+                stop_event.set()
+            return
+        if reply is None:
+            break
+        name, payload = reply
+        if name.startswith('decode-error:'):
+            print(f"[CLIENT] Server decode error: {name}")
+            continue
+        stats.add_received(len(payload))
+        out_path = decoded_dir / name
+        try:
+            out_path.write_bytes(payload)
+        except Exception as exc:
+            print(f"[CLIENT] WARN: failed to write {out_path.name}: {exc}")
+
+        stem = name.split('.', 1)[0]
+        with context_lock:
+            ctx = context_store.pop(stem, None)
+        if ctx is None:
+            print(f"[CLIENT] WARN: missing context for {name}")
+            continue
+
+        try:
+            dec_pts = load_points_from_bytes(payload)
+        except Exception as exc:
+            print(f"[CLIENT] WARN: failed to parse decoded payload for {name}: {exc}")
+            continue
+
+        frame_idx += 1
+        n_src, n_dec, diff, centroid_delta, centroid_norm, bbox_delta, mean_str, max_str = compute_metrics(
+            ctx.src_points, dec_pts, play_sample)
+        print(f"[FRAME {frame_idx:04d}] {ctx.name.split('.', 1)[0]}")
+        print(
+            "  points:  "
+            f"src={n_src}  dec={n_dec}  diff={diff:+d}"
+        )
+        print(
+            "  centroid diff (m):  "
+            f"x={centroid_delta[0]:+.3f}  y={centroid_delta[1]:+.3f}  z={centroid_delta[2]:+.3f}  ‖Δ‖={centroid_norm:.3f}"
+        )
+        print(
+            "  bbox size Δ (m):   "
+            f"x={bbox_delta[0]:+.3f}  y={bbox_delta[1]:+.3f}  z={bbox_delta[2]:+.3f}"
+        )
+        print(f"  mean|max dist (m): {mean_str}/{max_str}")
+        play_queue.put((frame_idx, ctx.name.split('.', 1)[0], ctx.src_points.astype(np.float32), dec_pts.astype(np.float32)))
+        print(f"[CLIENT] Received {name} ({len(payload)} bytes)")
+
+
+def ply_stream_reader(pipe: socket.socket,
+                      encode_queue: "queue.Queue[Optional[FrameJob]]",
+                      stop_event: threading.Event,
+                      error_queue: "queue.Queue[Exception]") -> None:
+    seq = 0
+    try:
+        with pipe, pipe.makefile('rb') as fh:
+            while not stop_event.is_set():
+                header = fh.read(4)
+                if not header:
+                    break
+                if len(header) < 4:
+                    raise ConnectionError("Incomplete frame header from stream")
+                name_len = struct.unpack('!I', header)[0]
+                if name_len == 0:
+                    break
+                name_b = fh.read(name_len)
+                if len(name_b) < name_len:
+                    raise ConnectionError("Stream closed while reading name")
+                name = name_b.decode('utf-8')
+                size_bytes = fh.read(8)
+                if len(size_bytes) < 8:
+                    raise ConnectionError("Stream closed while reading payload size")
+                size = struct.unpack('!Q', size_bytes)[0]
+                payload = bytearray()
+                remaining = size
+                while remaining:
+                    chunk = fh.read(min(65536, remaining))
+                    if not chunk:
+                        raise ConnectionError("Stream closed while reading payload")
+                    payload.extend(chunk)
+                    remaining -= len(chunk)
+                try:
+                    src_pts = load_points_from_bytes(bytes(payload))
+                except Exception as exc:
+                    error_queue.put(exc)
+                    stop_event.set()
+                    return
+                encode_queue.put(FrameJob(seq=seq, name=name, ply_bytes=bytes(payload), src_points=src_pts))
+                seq += 1
+    except Exception as exc:
+        if not stop_event.is_set():
+            error_queue.put(exc)
+            stop_event.set()
+    finally:
+        with suppress(Exception):
+            pipe.close()
+
+
+def launch_bag_to_ply(root: Path,
+                      args: argparse.Namespace,
+                      stream_fd: Optional[int] = None) -> subprocess.Popen:
+    script = root / 'data' / 'bag_to_ply.py'
+    cmd = [sys.executable, str(script),
+           '--topic', args.topic,
+           '--out', str(Path(args.ply_dir).resolve()),
+           '--prefix', args.prefix,
+           '--idle-timeout-sec', str(args.idle_timeout),
+    ]
+    if args.best_effort:
+        cmd.append('--best-effort')
+    if args.max_frames:
+        cmd += ['--max-frames', str(args.max_frames)]
+    pass_fds = ()
+    if stream_fd is not None:
+        cmd += ['--stream-fd', str(stream_fd)]
+        pass_fds = (stream_fd,)
+    return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, pass_fds=pass_fds)
+
+
 def main(argv: Iterable[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Streaming client with live playback")
+    ap = argparse.ArgumentParser(description="Streaming client with live playback (async)")
     ap.add_argument('--bag', required=True)
     ap.add_argument('--topic', required=True)
     ap.add_argument('--prefix', required=True)
@@ -267,6 +528,10 @@ def main(argv: Iterable[str] | None = None) -> None:
     ap.add_argument('--play-topic-prefix', default='stream_pair')
     ap.add_argument('--play-hz', type=float, default=10.0)
     ap.add_argument('--play-sample', type=int, default=50000)
+    ap.add_argument('--encoder-workers', type=int, default=0,
+                    help="Parallel Draco encoder workers (0 = auto)")
+    ap.add_argument('--max-pending', type=int, default=16,
+                    help="Max frames waiting to be encoded")
     args = ap.parse_args(argv)
 
     encoder = find_exe('draco_encoder', args.encoder)
@@ -279,92 +544,186 @@ def main(argv: Iterable[str] | None = None) -> None:
     decoded_dir = Path(args.decoded_dir).resolve()
     decoded_dir.mkdir(parents=True, exist_ok=True)
 
+    max_pending = max(1, args.max_pending)
+    cpu_count = os.cpu_count() or 1
+    if args.encoder_workers > 0:
+        worker_count = args.encoder_workers
+    else:
+        worker_count = max(1, cpu_count - 1)
+
+    stats = StreamingStats()
+    stop_event = threading.Event()
+    error_queue: "queue.Queue[Exception]" = queue.Queue()
+    encode_queue: "queue.Queue[Optional[FrameJob]]" = queue.Queue(maxsize=max_pending)
+    send_queue: "queue.Queue[Optional[tuple[int, str, Optional[bytes], FrameJob]]]" = queue.Queue()
+    context_store: Dict[str, FrameContext] = {}
+    context_lock = threading.Lock()
+
+    config_path = resolve_qos_override()
     bag_cmd = ['ros2', 'bag', 'play', str(Path(args.bag).resolve())]
-    qos_override = resolve_qos_override()
-    if qos_override is not None:
-        bag_cmd += ['--qos-profile-overrides-path', str(qos_override)]
+    if config_path is not None:
+        bag_cmd += ['--qos-profile-overrides-path', str(config_path)]
     else:
         print('[CLIENT] WARN: QoS override file not found, falling back to recorded QoS', file=sys.stderr)
     bag_process = subprocess.Popen(bag_cmd)
-    saver_proc = launch_bag_to_ply(root, args)
+
+    stream_parent, stream_child = socket.socketpair()
+    try:
+        saver_proc = launch_bag_to_ply(root, args, stream_fd=stream_child.fileno())
+    except Exception:
+        stream_parent.close()
+        stream_child.close()
+        raise
+    finally:
+        with suppress(Exception):
+            stream_child.close()
+
+    encode_threads = [
+        threading.Thread(
+            target=encode_worker,
+            args=(idx, encode_queue, send_queue, encoder, work_dir,
+                  args.cl, args.qp, args.qg, args.encoder_extra, stop_event),
+            name=f"encoder-{idx}",
+            daemon=True,
+        )
+        for idx in range(worker_count)
+    ]
+    for thread in encode_threads:
+        thread.start()
+
+    stream_thread = threading.Thread(
+        target=ply_stream_reader,
+        args=(stream_parent, encode_queue, stop_event, error_queue),
+        name="ply-stream",
+        daemon=True,
+    )
+    stream_thread.start()
 
     to_play: queue.Queue = queue.Queue()
     playback_thread = start_playback_thread(to_play, args.play_frame_id, args.play_topic_prefix, args.play_hz)
 
-    processed: Set[Path] = set()
-    frame_idx = 0
     start_time = time.monotonic()
-    bytes_sent = 0
-    bytes_received = 0
+    sender_thread: Optional[threading.Thread] = None
+    receiver_thread: Optional[threading.Thread] = None
+    encode_shutdown = False
+    sender_shutdown = False
 
     try:
         with socket.create_connection((args.server_host, args.server_port)) as sock:
             print(f"[CLIENT] Connected to {args.server_host}:{args.server_port}")
+            sender_thread = threading.Thread(
+                target=sender_loop,
+                args=(sock, send_queue, stats, stop_event, error_queue, context_store, context_lock),
+                name="sender",
+                daemon=True,
+            )
+            receiver_thread = threading.Thread(
+                target=receiver_loop,
+                args=(sock, decoded_dir, stats, stop_event, error_queue, context_store, context_lock,
+                      to_play, args.play_sample),
+                name="receiver",
+                daemon=True,
+            )
+            receiver_thread.start()
+            sender_thread.start()
+
             try:
-                while True:
-                    new_files = sorted(ply_dir.glob(f"{args.prefix}_*.ply"))
-                    for ply_path in new_files:
-                        if ply_path in processed:
-                            continue
-                        try:
-                            drc_bytes = encode_ply(encoder, ply_path, work_dir,
-                                                   args.cl, args.qp, args.qg,
-                                                   args.encoder_extra)
-                        except Exception as exc:
-                            print(f"[CLIENT] ENCODE FAIL {ply_path.name}: {exc}")
-                            processed.add(ply_path)
-                            continue
-                        send_message(sock, ply_path.name.replace('.ply', '.drc'), drc_bytes)
-                        bytes_sent += len(drc_bytes)
-                        print(f"[CLIENT] Sent {ply_path.name} ({len(drc_bytes)} bytes)")
-                        reply = recv_message(sock)
-                        if reply is None:
-                            raise ConnectionError("Server closed connection")
-                        name, payload = reply
-                        if name.startswith('decode-error:'):
-                            print(f"[CLIENT] Server decode error: {name}")
-                        else:
-                            out_path = decoded_dir / name
-                            out_path.write_bytes(payload)
-                            pts_src = load_points_from_path(ply_path)
-                            pts_dec = load_points_from_bytes(payload)
-                            frame_idx += 1
-                            n_src, n_dec, diff, centroid_delta, centroid_norm, bbox_delta, mean_str, max_str = compute_metrics(
-                                pts_src, pts_dec, args.play_sample)
-                            print(f"[FRAME {frame_idx:04d}] {ply_path.stem}")
-                            print(f"  points:  src={n_src}  dec={n_dec}  diff={diff:+d}")
-                            print(
-                                "  centroid diff (m):  "
-                                f"x={centroid_delta[0]:+.3f}  y={centroid_delta[1]:+.3f}  z={centroid_delta[2]:+.3f}  ‖Δ‖={centroid_norm:.3f}"
-                            )
-                            print(
-                                "  bbox size Δ (m):   "
-                                f"x={bbox_delta[0]:+.3f}  y={bbox_delta[1]:+.3f}  z={bbox_delta[2]:+.3f}"
-                            )
-                            print(f"  mean|max dist (m): {mean_str}/{max_str}")
-                            to_play.put((frame_idx, ply_path.stem, pts_src.astype(np.float32), pts_dec.astype(np.float32)))
-                            bytes_received += len(payload)
-                            print(f"[CLIENT] Received {name} ({len(payload)} bytes)")
-                        processed.add(ply_path)
+                while not stop_event.is_set():
+                    try:
+                        exc = error_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        raise exc
+
                     if saver_proc.poll() is not None and bag_process.poll() is not None:
-                        if len(processed) == len(list(ply_dir.glob(f"{args.prefix}_*.ply"))):
+                        stream_done = not stream_thread.is_alive()
+                        with context_lock:
+                            pending_contexts = bool(context_store)
+                        if stream_done and encode_queue.empty() and send_queue.empty() and not pending_contexts:
                             break
-                    time.sleep(0.2)
+                    time.sleep(0.05)
             finally:
-                send_message(sock, '', b'')
+                if not stop_event.is_set():
+                    encode_queue.join()
+                else:
+                    while True:
+                        try:
+                            encode_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        else:
+                            encode_queue.task_done()
+                for _ in encode_threads:
+                    encode_queue.put(None)
+                encode_shutdown = True
+                for thread in encode_threads:
+                    thread.join()
+
+                if sender_thread:
+                    send_queue.put(None)
+                    sender_shutdown = True
+                    send_queue.join()
+                    sender_thread.join()
+
+                with suppress(Exception):
+                    send_message(sock, '', b'')
+                stop_event.set()
+                with suppress(OSError):
+                    sock.shutdown(socket.SHUT_RD)
+                if receiver_thread:
+                    receiver_thread.join()
+    except Exception:
+        stop_event.set()
+        raise
     finally:
+        if not encode_shutdown:
+            for _ in encode_threads:
+                encode_queue.put(None)
+        for thread in encode_threads:
+            thread.join(timeout=1.0)
+        if sender_thread and not sender_shutdown:
+            send_queue.put(None)
+        if sender_thread:
+            sender_thread.join(timeout=1.0)
+        if receiver_thread and receiver_thread.is_alive():
+            stop_event.set()
+            receiver_thread.join(timeout=1.0)
+        if stream_thread.is_alive():
+            stop_event.set()
+            with suppress(Exception):
+                stream_parent.shutdown(socket.SHUT_RDWR)
+            stream_thread.join(timeout=1.0)
+        if stop_event.is_set():
+            with suppress(Exception):
+                if bag_process.poll() is None:
+                    bag_process.terminate()
+            with suppress(Exception):
+                if saver_proc.poll() is None:
+                    saver_proc.terminate()
         saver_proc.wait()
         bag_process.wait()
-        to_play.put(None)
-        playback_thread.join(timeout=5)
-        print("[CLIENT] Streaming playback completed")
-        elapsed = max(time.monotonic() - start_time, 1e-6)
-        total = bytes_sent + bytes_received
-        print("[CLIENT] ---- Bandwidth summary ----")
-        print(f"  elapsed: {elapsed:.2f} s")
-        print(f"  sent: {bytes_sent} bytes ({bytes_sent * 8 / elapsed / 1e6:.3f} Mbps)")
-        print(f"  received: {bytes_received} bytes ({bytes_received * 8 / elapsed / 1e6:.3f} Mbps)")
-        print(f"  total: {total} bytes ({total * 8 / elapsed / 1e6:.3f} Mbps)")
+
+    to_play.put(None)
+    playback_thread.join(timeout=5)
+
+    pending_error: Optional[Exception] = None
+    try:
+        pending_error = error_queue.get_nowait()
+    except queue.Empty:
+        pending_error = None
+    if pending_error:
+        raise pending_error
+
+    elapsed = max(time.monotonic() - start_time, 1e-6)
+    sent_bytes, received_bytes = stats.snapshot()
+    total = sent_bytes + received_bytes
+    print("[CLIENT] Streaming playback completed")
+    print("[CLIENT] ---- Bandwidth summary ----")
+    print(f"  elapsed: {elapsed:.2f} s")
+    print(f"  sent: {sent_bytes} bytes ({sent_bytes * 8 / elapsed / 1e6:.3f} Mbps)")
+    print(f"  received: {received_bytes} bytes ({received_bytes * 8 / elapsed / 1e6:.3f} Mbps)")
+    print(f"  total: {total} bytes ({total * 8 / elapsed / 1e6:.3f} Mbps)")
 
 
 if __name__ == '__main__':
