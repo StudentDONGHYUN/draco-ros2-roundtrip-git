@@ -115,9 +115,13 @@ def main():
     decoded_dir = Path(args.decoded_dir).resolve()
     decoded_dir.mkdir(parents=True, exist_ok=True)
 
-    bag_process = subprocess.Popen([
-        'ros2', 'bag', 'play', str(Path(args.bag).resolve())
-    ])
+    config_path = Path(__file__).resolve().parents[1] / 'configs' / 'qos_override.yaml'
+    bag_cmd = ['ros2', 'bag', 'play', str(Path(args.bag).resolve())]
+    if config_path.exists():
+        bag_cmd += ['--qos-profile-overrides-path', str(config_path)]
+    else:
+        print(f"[CLIENT] WARN: QoS override file not found at {config_path}", file=sys.stderr)
+    bag_process = subprocess.Popen(bag_cmd)
     saver_proc = launch_bag_to_ply(root, args)
 
     processed: Set[Path] = set()

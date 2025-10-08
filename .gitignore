@@ -5,6 +5,9 @@ backup_pre_cleanup_*.tar.gz
 # Runtime outputs and logs
 logs/
 ros2_ws/log/
+build/
+install/
+log/
 
 # Datasets/results that don't belong in git
 data/bags/

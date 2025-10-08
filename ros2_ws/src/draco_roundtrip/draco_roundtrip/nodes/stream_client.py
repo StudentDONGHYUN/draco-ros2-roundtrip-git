@@ -15,6 +15,11 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional, Set, Tuple
 
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:  # pragma: no cover - during setup or if ament not available
+    get_package_share_directory = None  # type: ignore
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -54,6 +59,24 @@ def find_exe(name: str, hint: Optional[str] = None) -> Path:
     if not found:
         raise FileNotFoundError(f"Unable to locate {name}")
     return Path(found)
+
+
+def resolve_qos_override() -> Optional[Path]:
+    candidates: list[Path] = []
+    if get_package_share_directory:
+        try:
+            share_dir = Path(get_package_share_directory('draco_roundtrip'))
+            candidates.append(share_dir / 'config' / 'qos_override.yaml')
+            candidates.append(share_dir / 'configs' / 'qos_override.yaml')
+        except Exception:
+            pass
+    # Fall back to source tree locations (symlink install, dev runs)
+    candidates.append(Path(__file__).resolve().parents[2] / 'configs' / 'qos_override.yaml')
+    candidates.append(Path(__file__).resolve().parents[3] / 'configs' / 'qos_override.yaml')
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def send_message(sock: socket.socket, name: str, payload: bytes) -> None:
@@ -256,7 +279,13 @@ def main(argv: Iterable[str] | None = None) -> None:
     decoded_dir = Path(args.decoded_dir).resolve()
     decoded_dir.mkdir(parents=True, exist_ok=True)
 
-    bag_process = subprocess.Popen(['ros2', 'bag', 'play', str(Path(args.bag).resolve())])
+    bag_cmd = ['ros2', 'bag', 'play', str(Path(args.bag).resolve())]
+    qos_override = resolve_qos_override()
+    if qos_override is not None:
+        bag_cmd += ['--qos-profile-overrides-path', str(qos_override)]
+    else:
+        print('[CLIENT] WARN: QoS override file not found, falling back to recorded QoS', file=sys.stderr)
+    bag_process = subprocess.Popen(bag_cmd)
     saver_proc = launch_bag_to_ply(root, args)
 
     to_play: queue.Queue = queue.Queue()
