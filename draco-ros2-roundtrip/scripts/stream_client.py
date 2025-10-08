@@ -213,7 +213,8 @@ def receiver_loop(sock: socket.socket,
                   decoded_dir: Path,
                   stats: StreamingStats,
                   stop_event: threading.Event,
-                  error_queue: "queue.Queue[Exception]") -> None:
+                  error_queue: "queue.Queue[Exception]",
+                  decoded_files: set[Path]) -> None:
     while not stop_event.is_set():
         try:
             reply = recv_message(sock)
@@ -233,6 +234,8 @@ def receiver_loop(sock: socket.socket,
             out_path.write_bytes(payload)
         except Exception as exc:
             print(f"[CLIENT] WARN: failed to write {out_path.name}: {exc}")
+        else:
+            decoded_files.add(out_path)
         stats.add_received(len(payload))
         print(f"[CLIENT] Received {name} ({len(payload)} bytes)")
 
@@ -352,6 +355,7 @@ def main():
     send_queue: "queue.Queue[Optional[tuple[int, str, Optional[bytes]]]]" = queue.Queue()
     encode_threads: list[threading.Thread] = []
     stream_thread: Optional[threading.Thread] = None
+    decoded_files: set[Path] = set()
 
     config_path = Path(__file__).resolve().parents[1] / 'configs' / 'qos_override.yaml'
     bag_cmd = ['ros2', 'bag', 'play', str(Path(args.bag).resolve())]
@@ -413,7 +417,7 @@ def main():
             )
             receiver_thread = threading.Thread(
                 target=receiver_loop,
-                args=(sock, decoded_dir, stats, stop_event, error_queue),
+                args=(sock, decoded_dir, stats, stop_event, error_queue, decoded_files),
                 name="receiver",
                 daemon=True,
             )
@@ -505,7 +509,11 @@ def main():
         pending_error = error_queue.get_nowait()
     except queue.Empty:
         pending_error = None
+
     if pending_error:
+        for path in decoded_files:
+            with suppress(FileNotFoundError):
+                path.unlink()
         raise pending_error
 
     elapsed = max(time.monotonic() - start_time, 1e-6)
@@ -517,6 +525,10 @@ def main():
     print(f"  sent: {sent_bytes} bytes ({sent_bytes * 8 / elapsed / 1e6:.3f} Mbps)")
     print(f"  received: {received_bytes} bytes ({received_bytes * 8 / elapsed / 1e6:.3f} Mbps)")
     print(f"  total: {total} bytes ({total * 8 / elapsed / 1e6:.3f} Mbps)")
+
+    for path in decoded_files:
+        with suppress(FileNotFoundError):
+            path.unlink()
 
 
 if __name__ == '__main__':

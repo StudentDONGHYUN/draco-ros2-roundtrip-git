@@ -379,7 +379,8 @@ def receiver_loop(sock: socket.socket,
                   context_store: Dict[str, FrameContext],
                   context_lock: threading.Lock,
                   play_queue: queue.Queue,
-                  play_sample: int) -> None:
+                  play_sample: int,
+                  decoded_files: set[Path]) -> None:
     frame_idx = 0
     while not stop_event.is_set():
         try:
@@ -401,6 +402,8 @@ def receiver_loop(sock: socket.socket,
             out_path.write_bytes(payload)
         except Exception as exc:
             print(f"[CLIENT] WARN: failed to write {out_path.name}: {exc}")
+        else:
+            decoded_files.add(out_path)
 
         stem = name.split('.', 1)[0]
         with context_lock:
@@ -601,6 +604,7 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     to_play: queue.Queue = queue.Queue()
     playback_thread = start_playback_thread(to_play, args.play_frame_id, args.play_topic_prefix, args.play_hz)
+    decoded_files: set[Path] = set()
 
     start_time = time.monotonic()
     sender_thread: Optional[threading.Thread] = None
@@ -620,7 +624,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             receiver_thread = threading.Thread(
                 target=receiver_loop,
                 args=(sock, decoded_dir, stats, stop_event, error_queue, context_store, context_lock,
-                      to_play, args.play_sample),
+                      to_play, args.play_sample, decoded_files),
                 name="receiver",
                 daemon=True,
             )
@@ -713,7 +717,14 @@ def main(argv: Iterable[str] | None = None) -> None:
     except queue.Empty:
         pending_error = None
     if pending_error:
+        for path in decoded_files:
+            with suppress(FileNotFoundError):
+                path.unlink()
         raise pending_error
+
+    for path in decoded_files:
+        with suppress(FileNotFoundError):
+            path.unlink()
 
     elapsed = max(time.monotonic() - start_time, 1e-6)
     sent_bytes, received_bytes = stats.snapshot()

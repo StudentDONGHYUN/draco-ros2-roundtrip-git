@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Optional
 
@@ -64,7 +65,12 @@ def decode_drc(decoder: Path, drc_bytes: bytes, out_dir: Path, stem: str) -> byt
     rc = subprocess.run(cmd, capture_output=True, text=True)
     if rc.returncode != 0:
         raise RuntimeError(f"draco_decoder failed: {rc.stderr.strip()}")
-    return ply_path.read_bytes()
+    data = ply_path.read_bytes()
+    with suppress(FileNotFoundError):
+        drc_path.unlink()
+    with suppress(FileNotFoundError):
+        ply_path.unlink()
+    return data
 
 
 def main():

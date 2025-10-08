@@ -1,15 +1,15 @@
 # draco-ros2-roundtrip-git
 
-Draco(구글의 3D 압축 라이브러리)를 이용해 LiDAR 포인트클라우드를 스트리밍하고 복원 품질을 검증하는 ROS 2 워크스페이스입니다. rosbag에 담긴 포인트클라우드를 PLY로 변환 → Draco로 압축 → TCP를 통해 서버에 전송 → 복원된 포인트클라우드를 다시 ROS 토픽으로 재생하는 전체 라운드트립 파이프라인을 제공합니다.
+Draco(구글의 3D 압축 라이브러리)를 이용해 LiDAR 포인트클라우드를 스트리밍하고 복원 품질을 검증하는 ROS 2 워크스페이스입니다. rosbag에 담긴 포인트클라우드를 메모리에서 바로 PLY 스트림으로 변환 → Draco로 압축 → TCP를 통해 서버에 전송 → 복원된 포인트클라우드를 다시 ROS 토픽으로 재생하는 전체 라운드트립 파이프라인을 제공합니다.
 
 ## 주요 구성 요소
 - `draco_roundtrip`
-  - `nodes/stream_client.py`, `nodes/stream_server.py`: TCP 스트리밍 노드가 `utils/` 모듈(프로토콜, PLY IO, metrics)에 의존하도록 모듈화되었습니다.
+  - `nodes/stream_client.py`, `nodes/stream_server.py`: bag 재생→인코딩→송신→수신을 큐/스레드로 비동기 처리하는 최신 파이프라인과 임시 파일 자동 정리를 제공합니다.
   - `cli/stream_client.py`, `cli/stream_server.py`, `cli/{monitor,replay}.py`: 동일한 로직을 `ros2 run`과 순수 Python CLI에서 공통으로 사용합니다.
-  - `tools/monitor.py`, `tools/replay.py`: RViz 비교 및 프레임 metrics 출력. 루트 `scripts/*.py` 는 모두 이 CLI로 래핑되었습니다.
+  - `tools/monitor.py`, `tools/replay.py`: RViz 비교 및 프레임 metrics 출력. 루트 `scripts/*.py` 는 모두 이 CLI를 래핑합니다.
 - `draco_tools`
   - `core/encoder.py`: Draco 인코딩을 단일 함수로 노출해 스트리밍 클라이언트/배치 인코더/오프라인 파이프라인이 재사용합니다.
-  - `cli/encode_ply_to_draco.py`, `bag_to_ply.py`, `offline_pipeline.py`: 공용 코어를 호출하는 CLI 유틸.
+  - `cli/encode_ply_to_draco.py`, `bag_to_ply.py`, `offline_pipeline.py`: 공용 코어를 호출하는 CLI 유틸. `bag_to_ply`는 `--stream-fd`를 받아 디스크 없이 PLY를 즉시 스트리밍할 수 있습니다.
   - `analysis/quality.py`: Chamfer-like 지표 계산을 `draco_roundtrip.utils` 의 metrics 와 공유합니다.
 - `slam_stream_bridge`: SLAM 실험과 연동할 수 있는 런치 파일 모음
 
@@ -39,7 +39,7 @@ source install/setup.bash
 ```bash
 ros2 run draco_roundtrip stream_server --port 5000
 ```
-`draco_decoder` 가 PATH에 없다면 `--decoder /absolute/path/to/draco_decoder` 로 직접 지정합니다. 서버는 수신한 Draco 파일을 지정된 임시 디렉터리에 저장하고, 디코딩 결과를 클라이언트에게 다시 전송합니다.
+`draco_decoder` 가 PATH에 없다면 `--decoder /absolute/path/to/draco_decoder` 로 직접 지정합니다. 서버는 디코딩을 마친 뒤 즉시 임시 `.drc`/`.decoded.ply` 파일을 삭제해 작업 디렉터리를 깨끗하게 유지합니다.
 
 ### 2. 클라이언트
 다른 터미널에서 다음과 같이 실행합니다.
@@ -47,13 +47,16 @@ ros2 run draco_roundtrip stream_server --port 5000
 ros2 run draco_roundtrip stream_client \
     --bag data/bags/rosbag2_2024_09_24-14_28_57 \
     --topic /sensing/lidar/top/pointcloud \
-    --prefix cycle_sample
+    --prefix cycle_sample \
+    --encoder-workers 0 \
+    --max-pending 16
 ```
 - rosbag 재생 시 `configs/qos_override.yaml`을 자동으로 적용해 QoS를 Best Effort로 낮춰줍니다.
 - 기본 `--idle-timeout` 은 10초로 설정되어 있어, 초기 로딩 동안 메시지를 기다릴 수 있습니다.
 - `--encoder` 옵션을 통해 `draco_encoder` 경로를 직접 지정할 수 있고, `--cl`, `--qp`, `--qg`를 통해 압축 품질을 조정할 수 있습니다.
+- `--encoder-workers` 를 생략하면 CPU 코어 수에서 1개를 남기고 자동으로 병렬 인코딩 스레드가 생성됩니다. `--max-pending` 으로 인코딩 대기 큐 길이를 제한할 수 있습니다.
 
-클라이언트가 실행되면 `data/ply_stream/`에 생성된 PLY 파일을 인코딩한 뒤 서버로 전송하며, 서버에서 돌려받은 복원 결과는 `data/decoded_from_server/`에 저장되고 동시에 ROS 토픽(`stream_pair/source`, `stream_pair/decoded`)으로 퍼블리시됩니다. RViz에서 두 토픽을 비교하면 복원 품질을 시각적으로 확인할 수 있습니다.
+비동기 파이프라인 덕분에 rosbag 재생 속도와 서버 처리 속도가 달라도 프레임이 쌓이지 않고 순차적으로 스트리밍됩니다. 모든 프레임을 처리하고 나면 `data/decoded_from_server/` 에서 생성된 파일은 자동으로 삭제됩니다. RViz에서 `stream_pair/source`, `stream_pair/decoded` 를 동시에 시각화하면 복원 품질을 확인할 수 있습니다.
 
 ### 3. 보조 유틸리티
 - PLY 생성만 필요한 경우:
@@ -166,11 +169,13 @@ ros2 run draco_roundtrip stream_client \
   ```
 
 - `data/`: rosbag, 인코딩된 `.drc`, 복원된 `.ply` 등 실험 산출물이 위치합니다. `.gitignore` 대상이므로 자유롭게 사용 가능합니다.
+- 스트리밍 클라이언트/서버는 실행이 끝나면 임시 `.drc`/`.decoded.ply` 파일을 자동으로 삭제하므로 디렉터리를 수동으로 정리할 필요가 없습니다.
 - `logs/`: 실행 로그 저장 위치. 필요 시 비우고 다시 사용하세요.
 - `ros2_ws/`: ROS 2 패키지 소스 및 빌드 아티팩트가 있는 워크스페이스 루트입니다.
 
 ## 문제 해결
 - **QoS mismatch**로 메시지가 수신되지 않을 경우, 클라이언트를 `--reliable` 로 실행하거나 rosbag을 재생할 때 다른 QoS 설정을 사용해 보세요.
+- 스트림 파이프가 조기에 끊기면 클라이언트가 즉시 종료되므로, 서버/클라이언트 로그에서 `[CLIENT] WARN: missing context` 등이 없는지 확인합니다.
 - `.ros/log` 가 가득 차 Permission 오류가 발생하면 `rm -rf ~/.ros/log/*` 로 정리한 뒤 다시 실행합니다.
 - Draco 실행 파일을 찾지 못하면 PATH 또는 환경 변수를 재확인하세요 (`which draco_encoder` 로 확인 가능).
 

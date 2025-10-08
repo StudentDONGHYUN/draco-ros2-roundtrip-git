@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from draco_roundtrip.utils import (
@@ -33,7 +34,12 @@ def decode_drc(decoder: Path, drc_bytes: bytes, out_dir: Path, stem: str) -> byt
             f"draco_decoder failed (rc={proc.returncode}):\n"
             f"STDOUT: {proc.stdout.strip()}\nSTDERR: {proc.stderr.strip()}"
         )
-    return ply_path.read_bytes()
+    data = ply_path.read_bytes()
+    with suppress(FileNotFoundError):
+        drc_path.unlink()
+    with suppress(FileNotFoundError):
+        ply_path.unlink()
+    return data
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
