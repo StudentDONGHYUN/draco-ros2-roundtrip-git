@@ -20,10 +20,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'stream_client = draco_roundtrip.nodes.stream_client:main',
-            'stream_server = draco_roundtrip.nodes.stream_server:main',
-            'stream_monitor = draco_roundtrip.tools.monitor:main',
-            'stream_replay = draco_roundtrip.tools.replay:main',
+            'stream_client = draco_roundtrip.cli.stream_client:main',
+            'stream_server = draco_roundtrip.cli.stream_server:main',
+            'stream_monitor = draco_roundtrip.cli.monitor:main',
+            'stream_replay = draco_roundtrip.cli.replay:main',
         ],
     },
 )

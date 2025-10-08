@@ -20,7 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'bag_to_ply = draco_tools.bag_to_ply:main',
-            'encode_ply_to_draco = draco_tools.encode_ply_to_draco:main',
+            'encode_ply_to_draco = draco_tools.cli.encode_ply_to_draco:main',
             'offline_pipeline = draco_tools.offline_pipeline:main',
         ],
     },

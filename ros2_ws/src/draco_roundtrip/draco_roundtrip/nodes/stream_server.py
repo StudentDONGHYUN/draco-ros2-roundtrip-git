@@ -1,83 +1,55 @@
 #!/usr/bin/env python3
 """Receive Draco .drc files over TCP, decode to PLY, send back to client."""
 
+from __future__ import annotations
+
 import argparse
 import socket
-import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
-
-def find_exe(name: str, hint: Optional[str] = None) -> Path:
-    if hint:
-        p = Path(hint).expanduser().resolve()
-        if p.is_file():
-            return p
-        candidate = p / name
-        if candidate.exists():
-            return candidate
-    from shutil import which
-    found = which(name)
-    if not found:
-        raise FileNotFoundError(f"Unable to locate {name}")
-    return Path(found)
-
-
-def recv_n(sock: socket.socket, n: int) -> bytes:
-    data = bytearray()
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
-            raise ConnectionError("connection closed prematurely")
-        data.extend(chunk)
-    return bytes(data)
-
-
-def recv_message(sock: socket.socket) -> Optional[tuple[str, bytes]]:
-    header = recv_n(sock, 4)
-    name_len = struct.unpack('!I', header)[0]
-    if name_len == 0:
-        return None
-    name = recv_n(sock, name_len).decode('utf-8')
-    size = struct.unpack('!Q', recv_n(sock, 8))[0]
-    payload = recv_n(sock, size)
-    return name, payload
-
-
-def send_message(sock: socket.socket, name: str, payload: bytes) -> None:
-    name_b = name.encode('utf-8')
-    sock.sendall(struct.pack('!I', len(name_b)))
-    sock.sendall(name_b)
-    sock.sendall(struct.pack('!Q', len(payload)))
-    sock.sendall(payload)
+from draco_roundtrip.utils import (
+    Message,
+    MSG_DATA,
+    MSG_ERROR,
+    ensure_directory,
+    recv_message,
+    resolve_executable,
+    send_message,
+)
 
 
 def decode_drc(decoder: Path, drc_bytes: bytes, out_dir: Path, stem: str) -> bytes:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_directory(out_dir)
     drc_path = out_dir / f"{stem}.drc"
     ply_path = out_dir / f"{stem}.decoded.ply"
     drc_path.write_bytes(drc_bytes)
     cmd = [str(decoder), "-i", str(drc_path), "-o", str(ply_path)]
-    rc = subprocess.run(cmd, capture_output=True, text=True)
-    if rc.returncode != 0:
-        raise RuntimeError(f"draco_decoder failed: {rc.stderr.strip()}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"draco_decoder failed (rc={proc.returncode}):\n"
+            f"STDOUT: {proc.stdout.strip()}\nSTDERR: {proc.stderr.strip()}"
+        )
     return ply_path.read_bytes()
 
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Draco streaming server")
     ap.add_argument('--host', default='0.0.0.0')
     ap.add_argument('--port', type=int, default=5000)
     ap.add_argument('--decoder', default=None, help="Path to draco_decoder")
     ap.add_argument('--work-dir', default='data/server_tmp')
-    args = ap.parse_args()
+    return ap
 
-    decoder = find_exe('draco_decoder', args.decoder)
-    work_dir = Path(args.work_dir).resolve()
-    work_dir.mkdir(parents=True, exist_ok=True)
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+
+    decoder = resolve_executable('draco_decoder', args.decoder, env_var='DRACO_DECODER')
+    work_dir = ensure_directory(Path(args.work_dir).resolve())
 
     start_time = time.monotonic()
     bytes_in = 0
@@ -93,21 +65,23 @@ def main():
                 if msg is None:
                     print("[SERVER] End of stream")
                     break
-                name, payload = msg
-                bytes_in += len(payload)
-                stem = Path(name).stem
-                print(f"[SERVER] Received {name} ({len(payload)} bytes)")
-                try:
-                    ply_bytes = decode_drc(decoder, payload, work_dir, stem)
-                except Exception as exc:
-                    err = f"decode-error:{exc}"
-                    send_message(conn, err, b"")
-                    print(f"[SERVER] ERROR {exc}")
+                if msg.kind != MSG_DATA:
+                    print(f"[SERVER] Ignoring unexpected message kind: {msg.kind}")
                     continue
-                send_name = f"{stem}.decoded.ply"
-                send_message(conn, send_name, ply_bytes)
+                stem = msg.name or "frame"
+                bytes_in += len(msg.payload)
+                print(f"[SERVER] Received {stem} ({len(msg.payload)} bytes)")
+                try:
+                    ply_bytes = decode_drc(decoder, msg.payload, work_dir, stem)
+                except Exception as exc:
+                    error_msg = Message(kind=MSG_ERROR, name=stem, payload=str(exc).encode())
+                    send_message(conn, error_msg)
+                    print(f"[SERVER] ERROR decoding {stem}: {exc}")
+                    continue
+                reply = Message(kind=MSG_DATA, name=f"{stem}.decoded", payload=ply_bytes)
+                send_message(conn, reply)
                 bytes_out += len(ply_bytes)
-                print(f"[SERVER] Sent {send_name} ({len(ply_bytes)} bytes)")
+                print(f"[SERVER] Sent {reply.name} ({len(ply_bytes)} bytes)")
 
     elapsed = max(time.monotonic() - start_time, 1e-6)
     total = bytes_in + bytes_out

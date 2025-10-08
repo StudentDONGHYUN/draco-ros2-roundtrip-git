@@ -1,56 +1,24 @@
 #!/usr/bin/env python3
 """Replay original & decoded PLY pairs as PointCloud2 topics for RViz comparison."""
 
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable
 
-import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header
 from sensor_msgs_py import point_cloud2 as pc2
+from std_msgs.msg import Header
 
-try:
-    import open3d as o3d  # type: ignore
-    _HAVE_O3D = True
-except Exception:  # pragma: no cover - optional dependency
-    _HAVE_O3D = False
-
-from plyfile import PlyData
-
-
-def _load_xyz(path: Path) -> np.ndarray:
-    if _HAVE_O3D:
-        pcd = o3d.io.read_point_cloud(str(path))
-        return np.asarray(pcd.points, dtype=np.float32)
-    ply = PlyData.read(str(path))
-    verts = ply["vertex"]
-    arr = np.vstack((verts["x"], verts["y"], verts["z"]))
-    return arr.T.astype(np.float32)
-
-
-def _trim_suffix(name: str, suffix: str) -> str:
-    return name[:-len(suffix)] if suffix and name.endswith(suffix) else name
-
-
-def _collect_pairs(orig_dir: Path, dec_dir: Path, prefix: str,
-                   suffix_orig: str, suffix_dec: str) -> List[Tuple[Path, Path, str]]:
-    orig_files = { _trim_suffix(p.name, suffix_orig): p for p in orig_dir.glob(f"{prefix}_*{suffix_orig}") }
-    dec_files = { _trim_suffix(p.name, suffix_dec): p for p in dec_dir.glob(f"{prefix}_*{suffix_dec}") }
-
-    stems = sorted(set(orig_files.keys()) & set(dec_files.keys()),
-                   key=lambda s: int(s.split("_")[-1]) if s.split("_")[-1].isdigit() else s)
-    pairs: List[Tuple[Path, Path, str]] = []
-    for stem in stems:
-        pairs.append((orig_files[stem], dec_files[stem], stem))
-    return pairs
+from draco_roundtrip.utils import collect_matching_pairs, load_points
 
 
 class PairReplay(Node):
-    def __init__(self, pairs: List[Tuple[Path, Path, str]], frame_id: str,
+    def __init__(self, pairs: list[tuple[Path, Path, str]], frame_id: str,
                  topic_prefix: str, hz: float, loop: bool):
         super().__init__("ply_pair_replay")
 
@@ -80,8 +48,8 @@ class PairReplay(Node):
         orig, dec, stem = self.pairs[self.index]
         self.index += 1
 
-        xyz_src = _load_xyz(orig)
-        xyz_dec = _load_xyz(dec)
+        xyz_src = load_points(orig)
+        xyz_dec = load_points(dec)
         if xyz_src.size == 0 and xyz_dec.size == 0:
             self.get_logger().warning(f"{stem}: both point clouds empty; skipping")
             return
@@ -100,7 +68,7 @@ class PairReplay(Node):
         )
 
 
-def main(argv: Iterable[str] = None) -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Replay original/decoded PLY pairs for RViz")
     ap.add_argument("--orig-dir", default="data/ply_raw", help="원본 PLY 디렉토리")
     ap.add_argument("--decoded-dir", default="data/tmp_decoded_ply", help="디코드 PLY 디렉토리")
@@ -112,13 +80,17 @@ def main(argv: Iterable[str] = None) -> None:
     ap.add_argument("--hz", type=float, default=5.0, help="재생 속도(Hz)")
     ap.add_argument("--loop", action="store_true", help="끝나면 처음부터 반복")
     ap.add_argument("--limit", type=int, default=0, help="0=전체, 양수=앞에서 N개만")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    args = build_arg_parser().parse_args(argv)
 
     orig_dir = Path(args.orig_dir).expanduser().resolve()
     dec_dir = Path(args.decoded_dir).expanduser().resolve()
 
-    pairs = _collect_pairs(orig_dir, dec_dir, args.prefix,
-                           args.orig_suffix, args.decoded_suffix)
+    pairs = collect_matching_pairs(orig_dir, dec_dir, args.prefix,
+                                   args.orig_suffix, args.decoded_suffix)
     if args.limit > 0:
         pairs = pairs[: args.limit]
     if not pairs:

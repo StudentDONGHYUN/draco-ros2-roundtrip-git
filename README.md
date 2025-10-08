@@ -4,10 +4,13 @@ Draco(구글의 3D 압축 라이브러리)를 이용해 LiDAR 포인트클라우
 
 ## 주요 구성 요소
 - `draco_roundtrip`
-  - `stream_server`: TCP로 `.drc` 파일을 받아 디코딩 후 결과 PLY를 돌려주는 서버 노드
-  - `stream_client`: rosbag 재생 + PLY 추출 + Draco 인코딩 + 서버 전송 + 복원 결과를 ROS 토픽으로 퍼블리시
-  - `tools/monitor`, `tools/replay`: 스트리밍 모니터링 및 오프라인 재생 유틸
-- `draco_tools`: `bag_to_ply`, `encode_ply_to_draco` 등 파이프라인에서 재사용되는 스크립트
+  - `nodes/stream_client.py`, `nodes/stream_server.py`: TCP 스트리밍 노드가 `utils/` 모듈(프로토콜, PLY IO, metrics)에 의존하도록 모듈화되었습니다.
+  - `cli/stream_client.py`, `cli/stream_server.py`, `cli/{monitor,replay}.py`: 동일한 로직을 `ros2 run`과 순수 Python CLI에서 공통으로 사용합니다.
+  - `tools/monitor.py`, `tools/replay.py`: RViz 비교 및 프레임 metrics 출력. 루트 `scripts/*.py` 는 모두 이 CLI로 래핑되었습니다.
+- `draco_tools`
+  - `core/encoder.py`: Draco 인코딩을 단일 함수로 노출해 스트리밍 클라이언트/배치 인코더/오프라인 파이프라인이 재사용합니다.
+  - `cli/encode_ply_to_draco.py`, `bag_to_ply.py`, `offline_pipeline.py`: 공용 코어를 호출하는 CLI 유틸.
+  - `analysis/quality.py`: Chamfer-like 지표 계산을 `draco_roundtrip.utils` 의 metrics 와 공유합니다.
 - `slam_stream_bridge`: SLAM 실험과 연동할 수 있는 런치 파일 모음
 
 ## 사전 준비
@@ -116,17 +119,11 @@ ros2 run draco_roundtrip stream_client \
   ├── README.md.keep
   ├── refac.md
   ├── ros2_ws
-  │   ├── build
-  │   ├── install
-  │   ├── log
-  │   └── src
-  ├── scripts
-  │   ├── ddscycle.sh
-  │   ├── netem_apply.sh
-  │   ├── run_client.sh
-  │   ├── run_server.sh
-  │   └── summarize.sh
-  └── tmp_ply
+      ├── build
+      ├── install
+      ├── log
+      └── src
+
   
   32 directories, 26 files
   ```
