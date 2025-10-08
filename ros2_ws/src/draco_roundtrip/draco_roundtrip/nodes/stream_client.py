@@ -394,8 +394,11 @@ def receiver_loop(sock: socket.socket,
                   context_lock: threading.Lock,
                   play_queue: queue.Queue,
                   play_sample: int,
-                  decoded_files: set[Path]) -> None:
+                  decoded_files: set[Path],
+                  print_metrics: bool) -> None:
     frame_idx = 0
+    next_play_seq = 0
+    pending_decoded: Dict[int, tuple[str, FrameContext, np.ndarray, str, int]] = {}
     while not stop_event.is_set():
         try:
             reply = recv_message(sock)
@@ -428,7 +431,7 @@ def receiver_loop(sock: socket.socket,
         stem_base = Path(name).stem
         stem = stem_base.split('.decoded', 1)[0]
         with context_lock:
-            ctx = context_store.pop(stem, None)
+            ctx = context_store.get(stem)
         if ctx is None:
             print(f"[CLIENT] WARN: missing context for {name}")
             continue
@@ -439,25 +442,38 @@ def receiver_loop(sock: socket.socket,
             print(f"[CLIENT] WARN: failed to parse decoded payload for {name}: {exc}")
             continue
 
-        frame_idx += 1
-        n_src, n_dec, diff, centroid_delta, centroid_norm, bbox_delta, mean_str, max_str = compute_metrics(
-            ctx.src_points, dec_pts, play_sample)
-        print(f"[FRAME {frame_idx:04d}] {ctx.name.split('.', 1)[0]}")
-        print(
-            "  points:  "
-            f"src={n_src}  dec={n_dec}  diff={diff:+d}"
-        )
-        print(
-            "  centroid diff (m):  "
-            f"x={centroid_delta[0]:+.3f}  y={centroid_delta[1]:+.3f}  z={centroid_delta[2]:+.3f}  ‖Δ‖={centroid_norm:.3f}"
-        )
-        print(
-            "  bbox size Δ (m):   "
-            f"x={bbox_delta[0]:+.3f}  y={bbox_delta[1]:+.3f}  z={bbox_delta[2]:+.3f}"
-        )
-        print(f"  mean|max dist (m): {mean_str}/{max_str}")
-        play_queue.put((frame_idx, ctx.name.split('.', 1)[0], ctx.frame_id, ctx.src_points.astype(np.float32), dec_pts.astype(np.float32)))
-        print(f"[CLIENT] Received {name} ({len(payload)} bytes)")
+        pending_decoded[ctx.seq] = (stem, ctx, dec_pts, name, len(payload))
+
+        while next_play_seq in pending_decoded:
+            stem_key, ctx_ready, dec_pts_ready, resp_name, payload_len = pending_decoded.pop(next_play_seq)
+            frame_idx += 1
+            metrics = compute_metrics(ctx_ready.src_points, dec_pts_ready, play_sample)
+            if print_metrics:
+                n_src, n_dec, diff, centroid_delta, centroid_norm, bbox_delta, mean_str, max_str = metrics
+                print(f"[FRAME {frame_idx:04d}] {ctx_ready.name.split('.', 1)[0]}")
+                print(
+                    "  points:  "
+                    f"src={n_src}  dec={n_dec}  diff={diff:+d}"
+                )
+                print(
+                    "  centroid diff (m):  "
+                    f"x={centroid_delta[0]:+.3f}  y={centroid_delta[1]:+.3f}  z={centroid_delta[2]:+.3f}  ‖Δ‖={centroid_norm:.3f}"
+                )
+                print(
+                    "  bbox size Δ (m):   "
+                    f"x={bbox_delta[0]:+.3f}  y={bbox_delta[1]:+.3f}  z={bbox_delta[2]:+.3f}"
+                )
+                print(f"  mean|max dist (m): {mean_str}/{max_str}")
+            play_queue.put(
+                (frame_idx,
+                 ctx_ready.name.split('.', 1)[0],
+                 ctx_ready.frame_id,
+                 ctx_ready.src_points.astype(np.float32),
+                 dec_pts_ready.astype(np.float32)))
+            print(f"[CLIENT] Received {resp_name} ({payload_len} bytes)")
+            with context_lock:
+                context_store.pop(stem_key, None)
+            next_play_seq += 1
 
 
 def ply_stream_reader(pipe: socket.socket,
@@ -563,6 +579,8 @@ def main(argv: Iterable[str] | None = None) -> None:
                     help="Parent frame used when broadcasting static TF for streamed clouds")
     ap.add_argument('--no-tf', action='store_true',
                     help="Disable automatic TF broadcasting for streamed frames")
+    ap.add_argument('--print-metrics', action='store_true',
+                    help="Print per-frame metrics when decoding frames")
     ap.add_argument('--encoder-workers', type=int, default=0,
                     help="Parallel Draco encoder workers (0 = auto)")
     ap.add_argument('--max-pending', type=int, default=16,
@@ -663,7 +681,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             receiver_thread = threading.Thread(
                 target=receiver_loop,
                 args=(sock, decoded_dir, stats, stop_event, error_queue, context_store, context_lock,
-                      to_play, args.play_sample, decoded_files),
+                      to_play, args.play_sample, decoded_files, args.print_metrics),
                 name="receiver",
                 daemon=True,
             )
