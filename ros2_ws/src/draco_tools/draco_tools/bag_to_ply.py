@@ -233,7 +233,7 @@ def main():
     qos_group.add_argument("--reliable", action="store_true", help="QoS RELIABLE")
     qos_group.add_argument("--best-effort", action="store_true", help="QoS BEST_EFFORT(기본)")
     ap.add_argument("--max-frames", type=int, default=0, help="저장할 프레임 수(0=무제한)")
-    ap.add_argument("--idle-timeout-sec", type=float, default=0.0,
+    ap.add_argument("--idle-timeout-sec", type=float, default=10.0,
                     help="수신 없을 때 자동 종료까지 대기 초(0=비활성)")
     ap.add_argument("--voxel-size", type=float, default=0.0,
                     help=">0이면 저장 전 voxel downsample 적용 (m)")

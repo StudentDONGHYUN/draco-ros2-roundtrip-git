@@ -256,7 +256,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     ap.add_argument('--qp', type=int, default=12)
     ap.add_argument('--qg', type=int, default=10)
     ap.add_argument('--encoder-extra', nargs='*', default=[])
-    ap.add_argument('--idle-timeout', type=float, default=2.0)
+    ap.add_argument('--idle-timeout', type=float, default=10.0)
     ap.add_argument('--max-frames', type=int, default=0)
     ap.add_argument('--best-effort', action='store_true')
     ap.add_argument('--work-dir', default='data/client_tmp')
