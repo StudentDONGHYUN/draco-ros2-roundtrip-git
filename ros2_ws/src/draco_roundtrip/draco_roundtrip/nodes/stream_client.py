@@ -27,6 +27,15 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Header
 
+from draco_roundtrip.utils import (
+    Message,
+    MSG_DATA,
+    MSG_EOF,
+    MSG_ERROR,
+    recv_message,
+    send_message,
+)
+
 try:
     from ament_index_python.packages import get_package_share_directory
 except ImportError:  # pragma: no cover - during setup or if ament not available
@@ -75,34 +84,6 @@ def resolve_qos_override() -> Optional[Path]:
         if candidate.exists():
             return candidate
     return None
-
-
-def send_message(sock: socket.socket, name: str, payload: bytes) -> None:
-    name_b = name.encode('utf-8')
-    sock.sendall(struct.pack('!I', len(name_b)))
-    sock.sendall(name_b)
-    sock.sendall(struct.pack('!Q', len(payload)))
-    sock.sendall(payload)
-
-
-def recv_message(sock: socket.socket) -> Optional[tuple[str, bytes]]:
-    header = sock.recv(4)
-    if not header:
-        return None
-    name_len = struct.unpack('!I', header)[0]
-    if name_len == 0:
-        return None
-    name = sock.recv(name_len).decode('utf-8')
-    size = struct.unpack('!Q', sock.recv(8))[0]
-    payload = b''
-    remaining = size
-    while remaining:
-        chunk = sock.recv(min(65536, remaining))
-        if not chunk:
-            raise ConnectionError("connection closed prematurely")
-        payload += chunk
-        remaining -= len(chunk)
-    return name, payload
 
 
 def encode_ply(encoder: Path, ply_path: Path, out_dir: Path,
@@ -331,7 +312,7 @@ def sender_loop(sock: socket.socket,
                         continue
                     message_name = pending_name.replace('.ply', '.drc')
                     try:
-                        send_message(sock, message_name, pending_payload)
+                        send_message(sock, Message(kind=MSG_DATA, name=message_name, payload=pending_payload))
                     except Exception as exc:
                         error_queue.put(exc)
                         stop_event.set()
@@ -357,7 +338,7 @@ def sender_loop(sock: socket.socket,
                 continue
             message_name = name.replace('.ply', '.drc')
             try:
-                send_message(sock, message_name, payload)
+                send_message(sock, Message(kind=MSG_DATA, name=message_name, payload=payload))
             except Exception as exc:
                 error_queue.put(exc)
                 stop_event.set()
@@ -392,10 +373,16 @@ def receiver_loop(sock: socket.socket,
             return
         if reply is None:
             break
-        name, payload = reply
-        if name.startswith('decode-error:'):
-            print(f"[CLIENT] Server decode error: {name}")
+        if reply.kind == MSG_EOF:
+            break
+        if reply.kind == MSG_ERROR:
+            print(f"[CLIENT] Server decode error: {reply.name}: {reply.payload.decode('utf-8', 'ignore')}")
             continue
+        if reply.kind != MSG_DATA:
+            print(f"[CLIENT] WARN: unexpected message kind {reply.kind}")
+            continue
+        name = reply.name or "frame"
+        payload = reply.payload
         stats.add_received(len(payload))
         out_path = decoded_dir / name
         try:
@@ -405,7 +392,8 @@ def receiver_loop(sock: socket.socket,
         else:
             decoded_files.add(out_path)
 
-        stem = name.split('.', 1)[0]
+        stem_base = Path(name).stem
+        stem = stem_base.split('.decoded', 1)[0]
         with context_lock:
             ctx = context_store.pop(stem, None)
         if ctx is None:
@@ -671,7 +659,7 @@ def main(argv: Iterable[str] | None = None) -> None:
                     sender_thread.join()
 
                 with suppress(Exception):
-                    send_message(sock, '', b'')
+                    send_message(sock, Message(kind=MSG_EOF, name='', payload=b''))
                 stop_event.set()
                 with suppress(OSError):
                     sock.shutdown(socket.SHUT_RD)

@@ -34,32 +34,65 @@ def find_exe(name: str, hint: Optional[str] = None) -> Path:
     return Path(found)
 
 
-def send_message(sock: socket.socket, name: str, payload: bytes) -> None:
-    name_b = name.encode('utf-8')
-    sock.sendall(struct.pack('!I', len(name_b)))
-    sock.sendall(name_b)
-    sock.sendall(struct.pack('!Q', len(payload)))
-    sock.sendall(payload)
+_HEADER = struct.Struct('!I')
+_SIZE = struct.Struct('!Q')
+_SEPARATOR = ':'
+
+MSG_DATA = 'data'
+MSG_ERROR = 'error'
+MSG_EOF = 'eof'
 
 
-def recv_message(sock: socket.socket) -> Optional[tuple[str, bytes]]:
-    header = sock.recv(4)
+@dataclass
+class Message:
+    kind: str
+    name: str
+    payload: bytes
+
+    def as_meta(self) -> str:
+        return f"{self.kind}{_SEPARATOR}{self.name}" if self.name else self.kind
+
+    @classmethod
+    def from_meta(cls, meta: str, payload: bytes) -> "Message":
+        if _SEPARATOR in meta:
+            kind, name = meta.split(_SEPARATOR, 1)
+        else:
+            kind, name = MSG_DATA, meta
+        return cls(kind=kind or MSG_DATA, name=name, payload=payload)
+
+
+def send_message(sock: socket.socket, message: Message) -> None:
+    meta = message.as_meta().encode('utf-8')
+    sock.sendall(_HEADER.pack(len(meta)))
+    sock.sendall(meta)
+    sock.sendall(_SIZE.pack(len(message.payload)))
+    if message.payload:
+        sock.sendall(message.payload)
+
+
+def recv_message(sock: socket.socket) -> Optional[Message]:
+    header = sock.recv(_HEADER.size)
     if not header:
         return None
-    name_len = struct.unpack('!I', header)[0]
-    if name_len == 0:
+    if len(header) != _HEADER.size:
+        raise RuntimeError('incomplete header')
+    (name_len,) = _HEADER.unpack(header)
+    if name_len <= 0:
         return None
-    name = sock.recv(name_len).decode('utf-8')
-    size = struct.unpack('!Q', sock.recv(8))[0]
-    payload = b''
-    remaining = size
-    while remaining:
-        chunk = sock.recv(min(65536, remaining))
+    meta = _read_exact(sock, name_len).decode('utf-8')
+    (payload_len,) = _SIZE.unpack(_read_exact(sock, _SIZE.size))
+    payload = _read_exact(sock, payload_len) if payload_len else b''
+    return Message.from_meta(meta, payload)
+
+
+def _read_exact(sock: socket.socket, size: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
         if not chunk:
-            raise ConnectionError("connection closed prematurely")
-        payload += chunk
-        remaining -= len(chunk)
-    return name, payload
+            raise ConnectionError('socket closed while reading')
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 def encode_ply(encoder: Path, ply_path: Path, out_dir: Path,
@@ -180,7 +213,7 @@ def sender_loop(sock: socket.socket,
                         continue
                     message_name = pending_name.replace('.ply', '.drc')
                     try:
-                        send_message(sock, message_name, pending_payload)
+                        send_message(sock, Message(kind=MSG_DATA, name=message_name, payload=pending_payload))
                     except Exception as exc:
                         error_queue.put(exc)
                         stop_event.set()
@@ -199,7 +232,7 @@ def sender_loop(sock: socket.socket,
                 continue
             message_name = name.replace('.ply', '.drc')
             try:
-                send_message(sock, message_name, payload)
+                send_message(sock, Message(kind=MSG_DATA, name=message_name, payload=payload))
             except Exception as exc:
                 error_queue.put(exc)
                 stop_event.set()
@@ -225,10 +258,17 @@ def receiver_loop(sock: socket.socket,
             return
         if reply is None:
             break
-        name, payload = reply
-        if name.startswith('decode-error:'):
-            print(f"[CLIENT] Server decode error: {name}")
+        if reply.kind == MSG_EOF:
+            break
+        if reply.kind == MSG_ERROR:
+            detail = reply.payload.decode('utf-8', 'ignore')
+            print(f"[CLIENT] Server decode error: {reply.name or 'unknown'}: {detail}")
             continue
+        if reply.kind != MSG_DATA:
+            print(f"[CLIENT] WARN: unexpected message kind {reply.kind}")
+            continue
+        name = reply.name or "frame"
+        payload = reply.payload
         out_path = decoded_dir / name
         try:
             out_path.write_bytes(payload)
@@ -462,7 +502,7 @@ def main():
                     sender_thread.join()
 
                 with suppress(Exception):
-                    send_message(sock, '', b'')
+                    send_message(sock, Message(kind=MSG_EOF, name='', payload=b''))
                 stop_event.set()
                 with suppress(OSError):
                     sock.shutdown(socket.SHUT_RD)

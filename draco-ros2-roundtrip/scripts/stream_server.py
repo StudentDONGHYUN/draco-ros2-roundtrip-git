@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -37,23 +38,52 @@ def recv_n(sock: socket.socket, n: int) -> bytes:
     return bytes(data)
 
 
-def recv_message(sock: socket.socket) -> Optional[tuple[str, bytes]]:
-    header = recv_n(sock, 4)
-    name_len = struct.unpack('!I', header)[0]
-    if name_len == 0:
+MSG_DATA = 'data'
+MSG_ERROR = 'error'
+MSG_EOF = 'eof'
+_SEPARATOR = ':'
+
+
+@dataclass
+class Message:
+    kind: str
+    name: str
+    payload: bytes
+
+    def as_meta(self) -> str:
+        return f"{self.kind}{_SEPARATOR}{self.name}" if self.name else self.kind
+
+    @classmethod
+    def from_meta(cls, meta: str, payload: bytes) -> "Message":
+        if _SEPARATOR in meta:
+            kind, name = meta.split(_SEPARATOR, 1)
+        else:
+            kind, name = MSG_DATA, meta
+        return cls(kind=kind or MSG_DATA, name=name, payload=payload)
+
+
+def recv_message(sock: socket.socket) -> Optional[Message]:
+    header = sock.recv(4)
+    if not header:
         return None
-    name = recv_n(sock, name_len).decode('utf-8')
+    if len(header) != 4:
+        raise RuntimeError('incomplete header')
+    name_len = struct.unpack('!I', header)[0]
+    if name_len <= 0:
+        return None
+    meta = recv_n(sock, name_len).decode('utf-8')
     size = struct.unpack('!Q', recv_n(sock, 8))[0]
-    payload = recv_n(sock, size)
-    return name, payload
+    payload = recv_n(sock, size) if size else b''
+    return Message.from_meta(meta, payload)
 
 
-def send_message(sock: socket.socket, name: str, payload: bytes) -> None:
-    name_b = name.encode('utf-8')
-    sock.sendall(struct.pack('!I', len(name_b)))
-    sock.sendall(name_b)
-    sock.sendall(struct.pack('!Q', len(payload)))
-    sock.sendall(payload)
+def send_message(sock: socket.socket, message: Message) -> None:
+    meta = message.as_meta().encode('utf-8')
+    sock.sendall(struct.pack('!I', len(meta)))
+    sock.sendall(meta)
+    sock.sendall(struct.pack('!Q', len(message.payload)))
+    if message.payload:
+        sock.sendall(message.payload)
 
 
 def decode_drc(decoder: Path, drc_bytes: bytes, out_dir: Path, stem: str) -> bytes:
@@ -99,19 +129,26 @@ def main():
                 if msg is None:
                     print("[SERVER] End of stream")
                     break
-                name, payload = msg
+                if msg.kind == MSG_EOF:
+                    print("[SERVER] EOF received")
+                    break
+                if msg.kind != MSG_DATA:
+                    print(f"[SERVER] Ignoring unexpected message kind: {msg.kind}")
+                    continue
+                name = msg.name or "frame"
+                payload = msg.payload
                 bytes_in += len(payload)
                 stem = Path(name).stem
                 print(f"[SERVER] Received {name} ({len(payload)} bytes)")
                 try:
                     ply_bytes = decode_drc(decoder, payload, work_dir, stem)
                 except Exception as exc:
-                    err = f"decode-error:{exc}"
-                    send_message(conn, err, b"")
+                    error_msg = Message(kind=MSG_ERROR, name=name, payload=str(exc).encode())
+                    send_message(conn, error_msg)
                     print(f"[SERVER] ERROR {exc}")
                     continue
                 send_name = f"{stem}.decoded.ply"
-                send_message(conn, send_name, ply_bytes)
+                send_message(conn, Message(kind=MSG_DATA, name=send_name, payload=ply_bytes))
                 bytes_out += len(ply_bytes)
                 print(f"[SERVER] Sent {send_name} ({len(ply_bytes)} bytes)")
 

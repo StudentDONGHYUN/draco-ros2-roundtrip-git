@@ -74,17 +74,18 @@ def main(argv: list[str] | None = None) -> None:
                 if msg.kind != MSG_DATA:
                     print(f"[SERVER] Ignoring unexpected message kind: {msg.kind}")
                     continue
-                stem = msg.name or "frame"
+                stem_raw = msg.name or "frame"
+                stem = Path(stem_raw).stem
                 bytes_in += len(msg.payload)
-                print(f"[SERVER] Received {stem} ({len(msg.payload)} bytes)")
+                print(f"[SERVER] Received {stem_raw} ({len(msg.payload)} bytes)")
                 try:
                     ply_bytes = decode_drc(decoder, msg.payload, work_dir, stem)
                 except Exception as exc:
-                    error_msg = Message(kind=MSG_ERROR, name=stem, payload=str(exc).encode())
+                    error_msg = Message(kind=MSG_ERROR, name=stem_raw, payload=str(exc).encode())
                     send_message(conn, error_msg)
                     print(f"[SERVER] ERROR decoding {stem}: {exc}")
                     continue
-                reply = Message(kind=MSG_DATA, name=f"{stem}.decoded", payload=ply_bytes)
+                reply = Message(kind=MSG_DATA, name=f"{stem}.decoded.ply", payload=ply_bytes)
                 send_message(conn, reply)
                 bytes_out += len(ply_bytes)
                 print(f"[SERVER] Sent {reply.name} ({len(ply_bytes)} bytes)")
