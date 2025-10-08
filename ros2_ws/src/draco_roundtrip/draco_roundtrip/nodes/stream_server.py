@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Receive Draco .drc files over TCP, decode to PLY, send back to client."""
+"""Receive Draco .drc files over TCP, decode with worker pool, send back to client."""
 
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import subprocess
 import sys
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Event, Lock, Thread
+from typing import Dict, Optional
 
 from draco_roundtrip.utils import (
     Message,
     MSG_DATA,
+    MSG_EOF,
     MSG_ERROR,
     ensure_directory,
     recv_message,
@@ -22,10 +28,27 @@ from draco_roundtrip.utils import (
 )
 
 
-def decode_drc(decoder: Path, drc_bytes: bytes, out_dir: Path, stem: str) -> bytes:
+@dataclass
+class DecodeJob:
+    seq: int
+    stem: str
+    payload: bytes
+
+
+@dataclass
+class DecodeResult:
+    seq: int
+    stem: str
+    data: Optional[bytes]
+    error: Optional[str]
+
+
+def decode_drc(decoder: Path, drc_bytes: bytes, out_dir: Path, stem: str, seq: int) -> bytes:
+    """Decode a Draco payload into PLY bytes, using unique filenames per job."""
     ensure_directory(out_dir)
-    drc_path = out_dir / f"{stem}.drc"
-    ply_path = out_dir / f"{stem}.decoded.ply"
+    unique = f"{stem}_{seq}"
+    drc_path = out_dir / f"{unique}.drc"
+    ply_path = out_dir / f"{unique}.decoded.ply"
     drc_path.write_bytes(drc_bytes)
     cmd = [str(decoder), "-i", str(drc_path), "-o", str(ply_path)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -48,48 +71,129 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument('--port', type=int, default=5000)
     ap.add_argument('--decoder', default=None, help="Path to draco_decoder")
     ap.add_argument('--work-dir', default='data/server_tmp')
+    ap.add_argument('--decoder-workers', type=int, default=0,
+                    help="Parallel decoder workers (0 = auto)")
     return ap
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: Optional[list[str]] = None) -> None:
     args = build_arg_parser().parse_args(argv)
 
     decoder = resolve_executable('draco_decoder', args.decoder, env_var='DRACO_DECODER')
     work_dir = ensure_directory(Path(args.work_dir).resolve())
 
-    start_time = time.monotonic()
+    cpu_count = os.cpu_count() or 1
+    worker_count = args.decoder_workers if args.decoder_workers > 0 else max(1, min(4, cpu_count))
+
+    decode_queue: "Queue[Optional[DecodeJob]]" = Queue(maxsize=worker_count * 2)
+    result_queue: "Queue[Optional[DecodeResult]]" = Queue()
+    stop_event = Event()
+    bytes_lock = Lock()
     bytes_in = 0
     bytes_out = 0
+
+    def worker_loop() -> None:
+        while True:
+            job = decode_queue.get()
+            if job is None:
+                decode_queue.task_done()
+                break
+            try:
+                ply_bytes = decode_drc(decoder, job.payload, work_dir, job.stem, job.seq)
+                result_queue.put(DecodeResult(seq=job.seq, stem=job.stem, data=ply_bytes, error=None))
+            except Exception as exc:  # pylint: disable=broad-except
+                result_queue.put(DecodeResult(seq=job.seq, stem=job.stem, data=None, error=str(exc)))
+            finally:
+                decode_queue.task_done()
+
+    workers = [Thread(target=worker_loop, name=f"decoder-{i}", daemon=True) for i in range(worker_count)]
+    for t in workers:
+        t.start()
+
+    start_time = time.monotonic()
 
     with socket.create_server((args.host, args.port), reuse_port=True) as server:
         print(f"[SERVER] Listening on {args.host}:{args.port}")
         conn, addr = server.accept()
         print(f"[SERVER] Connection from {addr}")
-        with conn:
-            while True:
-                msg = recv_message(conn)
-                if msg is None:
-                    print("[SERVER] End of stream")
-                    break
-                if msg.kind != MSG_DATA:
-                    print(f"[SERVER] Ignoring unexpected message kind: {msg.kind}")
-                    continue
-                stem_raw = msg.name or "frame"
-                base_stem, _, _frame_meta = stem_raw.partition('|')
-                stem = Path(base_stem).stem
-                bytes_in += len(msg.payload)
-                print(f"[SERVER] Received {stem_raw} ({len(msg.payload)} bytes)")
+
+        total_jobs = 0
+
+        def sender_loop() -> None:
+            nonlocal bytes_out
+            nonlocal total_jobs
+            pending: Dict[int, DecodeResult] = {}
+            next_seq = 0
+            processed = 0
+            while not stop_event.is_set():
                 try:
-                    ply_bytes = decode_drc(decoder, msg.payload, work_dir, stem)
-                except Exception as exc:
-                    error_msg = Message(kind=MSG_ERROR, name=stem_raw, payload=str(exc).encode())
-                    send_message(conn, error_msg)
-                    print(f"[SERVER] ERROR decoding {stem}: {exc}")
+                    item = result_queue.get(timeout=0.1)
+                except Empty:
+                    if processed >= total_jobs and decode_queue.empty():
+                        break
                     continue
-                reply = Message(kind=MSG_DATA, name=f"{stem}.decoded.ply", payload=ply_bytes)
-                send_message(conn, reply)
-                bytes_out += len(ply_bytes)
-                print(f"[SERVER] Sent {reply.name} ({len(ply_bytes)} bytes)")
+                if item is None:
+                    result_queue.task_done()
+                    break
+                pending[item.seq] = item
+                while next_seq in pending:
+                    result = pending.pop(next_seq)
+                    if result.error is not None:
+                        msg = Message(kind=MSG_ERROR, name=result.stem, payload=result.error.encode())
+                    else:
+                        payload = result.data or b""
+                        msg = Message(kind=MSG_DATA, name=f"{result.stem}.decoded.ply", payload=payload)
+                        with bytes_lock:
+                            bytes_out += len(payload)
+                    try:
+                        send_message(conn, msg)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        print(f"[SERVER] ERROR sending {result.stem}: {exc}")
+                        stop_event.set()
+                        break
+                    next_seq += 1
+                    processed += 1
+                result_queue.task_done()
+                if processed >= total_jobs and decode_queue.empty() and not pending:
+                    break
+
+        with conn:
+            total_jobs = 0
+            sender_thread = Thread(target=sender_loop, daemon=True)
+            sender_thread.start()
+            seq = 0
+            try:
+                while not stop_event.is_set():
+                    msg = recv_message(conn)
+                    if msg is None:
+                        print("[SERVER] End of stream")
+                        break
+                    if msg.kind == MSG_EOF:
+                        print("[SERVER] EOF received")
+                        break
+                    if msg.kind != MSG_DATA:
+                        print(f"[SERVER] Ignoring unexpected message kind: {msg.kind}")
+                        continue
+                    stem_raw = msg.name or "frame"
+                    base_stem, _, _meta = stem_raw.partition('|')
+                    stem = Path(base_stem).stem
+                    with bytes_lock:
+                        bytes_in += len(msg.payload)
+                    print(f"[SERVER] Received {stem_raw} ({len(msg.payload)} bytes)")
+                    decode_queue.put(DecodeJob(seq=seq, stem=stem, payload=msg.payload))
+                    seq += 1
+                    total_jobs += 1
+            finally:
+                stop_event.set()
+                for _ in workers:
+                    decode_queue.put(None)
+                decode_queue.join()
+                result_queue.put(None)
+                sender_thread.join()
+                for t in workers:
+                    t.join()
+                with suppress(Exception):
+                    send_message(conn, Message(kind=MSG_EOF, name='', payload=b''))
 
     elapsed = max(time.monotonic() - start_time, 1e-6)
     total = bytes_in + bytes_out
