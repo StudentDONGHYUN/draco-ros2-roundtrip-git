@@ -13,7 +13,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Event, Lock, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 from typing import Dict, Optional
 
 from draco_roundtrip.utils import (
@@ -85,12 +85,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     cpu_count = os.cpu_count() or 1
     worker_count = args.decoder_workers if args.decoder_workers > 0 else max(1, min(4, cpu_count))
 
-    decode_queue: "Queue[Optional[DecodeJob]]" = Queue(maxsize=worker_count * 2)
+    decode_queue: "Queue[Optional[DecodeJob]]" = Queue()
     result_queue: "Queue[Optional[DecodeResult]]" = Queue()
     stop_event = Event()
     bytes_lock = Lock()
     bytes_in = 0
     bytes_out = 0
+    job_slots = BoundedSemaphore(worker_count * 2)
 
     def worker_loop() -> None:
         while True:
@@ -104,6 +105,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             except Exception as exc:  # pylint: disable=broad-except
                 result_queue.put(DecodeResult(seq=job.seq, stem=job.stem, data=None, error=str(exc)))
             finally:
+                job_slots.release()
                 decode_queue.task_done()
 
     workers = [Thread(target=worker_loop, name=f"decoder-{i}", daemon=True) for i in range(worker_count)]
@@ -180,7 +182,18 @@ def main(argv: Optional[list[str]] = None) -> None:
                     with bytes_lock:
                         bytes_in += len(msg.payload)
                     print(f"[SERVER] Received {stem_raw} ({len(msg.payload)} bytes)")
-                    decode_queue.put(DecodeJob(seq=seq, stem=stem, payload=msg.payload))
+                    acquired = False
+                    while not stop_event.is_set():
+                        if job_slots.acquire(timeout=0.1):
+                            acquired = True
+                            break
+                    if not acquired:
+                        break
+                    try:
+                        decode_queue.put(DecodeJob(seq=seq, stem=stem, payload=msg.payload))
+                    except Exception:
+                        job_slots.release()
+                        raise
                     seq += 1
                     total_jobs += 1
             finally:

@@ -214,6 +214,37 @@ class FrameContext:
     frame_id: str
 
 
+@dataclass
+class PendingDecodeResult:
+    ctx: FrameContext
+    response_name: str
+    payload_len: int
+    points: Optional[np.ndarray] = None
+    error: Optional[str] = None
+
+
+class PipelineBudget:
+    def __init__(self, limit: int) -> None:
+        self._sem = threading.BoundedSemaphore(limit)
+        self._lock = threading.Lock()
+        self._active: set[int] = set()
+
+    def reserve(self, seq: int, stop_event: threading.Event) -> bool:
+        while not stop_event.is_set():
+            if self._sem.acquire(timeout=0.1):
+                with self._lock:
+                    self._active.add(seq)
+                return True
+        return False
+
+    def release(self, seq: int) -> None:
+        with self._lock:
+            if seq not in self._active:
+                return
+            self._active.remove(seq)
+        self._sem.release()
+
+
 class PlaybackNode(Node):
     def __init__(self, queue_obj: queue.Queue, default_frame_id: str,
                  topic_prefix: str, hz: float, tf_parent: str,
@@ -323,7 +354,8 @@ def sender_loop(sock: socket.socket,
                 stop_event: threading.Event,
                 error_queue: "queue.Queue[Exception]",
                 context_store: Dict[str, FrameContext],
-                context_lock: threading.Lock) -> None:
+                context_lock: threading.Lock,
+                budget: PipelineBudget) -> None:
     pending: Dict[int, tuple[str, Optional[bytes], FrameJob]] = {}
     next_seq = 0
     try:
@@ -339,12 +371,14 @@ def sender_loop(sock: socket.socket,
                 while next_seq in pending:
                     pending_name, pending_payload, pending_job = pending.pop(next_seq)
                     if pending_payload is None:
+                        budget.release(pending_job.seq)
                         next_seq += 1
                         continue
                     message_name = pending_name.replace('.ply', '.drc')
                     try:
                         send_message(sock, Message(kind=MSG_DATA, name=message_name, payload=pending_payload))
                     except Exception as exc:
+                        budget.release(pending_job.seq)
                         error_queue.put(exc)
                         stop_event.set()
                         return
@@ -363,15 +397,21 @@ def sender_loop(sock: socket.socket,
             finally:
                 send_queue.task_done()
     finally:
-        while next_seq in pending and not stop_event.is_set():
+        while next_seq in pending:
             name, payload, job = pending.pop(next_seq)
             if payload is None:
+                budget.release(job.seq)
+                next_seq += 1
+                continue
+            if stop_event.is_set():
+                budget.release(job.seq)
                 next_seq += 1
                 continue
             message_name = name.replace('.ply', '.drc')
             try:
                 send_message(sock, Message(kind=MSG_DATA, name=message_name, payload=payload))
             except Exception as exc:
+                budget.release(job.seq)
                 error_queue.put(exc)
                 stop_event.set()
                 return
@@ -395,92 +435,140 @@ def receiver_loop(sock: socket.socket,
                   play_queue: queue.Queue,
                   play_sample: int,
                   decoded_files: set[Path],
-                  print_metrics: bool) -> None:
+                  print_metrics: bool,
+                  budget: PipelineBudget) -> None:
     frame_idx = 0
     next_play_seq = 0
-    pending_decoded: Dict[int, tuple[str, FrameContext, np.ndarray, str, int]] = {}
-    while not stop_event.is_set():
-        try:
-            reply = recv_message(sock)
-        except Exception as exc:
-            if not stop_event.is_set():
-                error_queue.put(exc)
-                stop_event.set()
-            return
-        if reply is None:
-            break
-        if reply.kind == MSG_EOF:
-            break
-        if reply.kind == MSG_ERROR:
-            print(f"[CLIENT] Server decode error: {reply.name}: {reply.payload.decode('utf-8', 'ignore')}")
-            continue
-        if reply.kind != MSG_DATA:
-            print(f"[CLIENT] WARN: unexpected message kind {reply.kind}")
-            continue
-        name = reply.name or "frame"
-        payload = reply.payload
-        stats.add_received(len(payload))
-        out_path = decoded_dir / name
-        try:
-            out_path.write_bytes(payload)
-        except Exception as exc:
-            print(f"[CLIENT] WARN: failed to write {out_path.name}: {exc}")
-        else:
-            decoded_files.add(out_path)
+    pending_decoded: Dict[int, PendingDecodeResult] = {}
 
-        stem_base = Path(name).stem
-        stem = stem_base.split('.decoded', 1)[0]
-        with context_lock:
-            ctx = context_store.get(stem)
-        if ctx is None:
-            print(f"[CLIENT] WARN: missing context for {name}")
-            continue
-
-        try:
-            dec_pts = load_points_from_bytes(payload)
-        except Exception as exc:
-            print(f"[CLIENT] WARN: failed to parse decoded payload for {name}: {exc}")
-            continue
-
-        pending_decoded[ctx.seq] = (stem, ctx, dec_pts, name, len(payload))
-
+    def drain_ready_frames() -> None:
+        nonlocal next_play_seq, frame_idx
         while next_play_seq in pending_decoded:
-            stem_key, ctx_ready, dec_pts_ready, resp_name, payload_len = pending_decoded.pop(next_play_seq)
-            frame_idx += 1
-            metrics = compute_metrics(ctx_ready.src_points, dec_pts_ready, play_sample)
-            if print_metrics:
-                n_src, n_dec, diff, centroid_delta, centroid_norm, bbox_delta, mean_str, max_str = metrics
-                print(f"[FRAME {frame_idx:04d}] {ctx_ready.name.split('.', 1)[0]}")
-                print(
-                    "  points:  "
-                    f"src={n_src}  dec={n_dec}  diff={diff:+d}"
-                )
-                print(
-                    "  centroid diff (m):  "
-                    f"x={centroid_delta[0]:+.3f}  y={centroid_delta[1]:+.3f}  z={centroid_delta[2]:+.3f}  ‖Δ‖={centroid_norm:.3f}"
-                )
-                print(
-                    "  bbox size Δ (m):   "
-                    f"x={bbox_delta[0]:+.3f}  y={bbox_delta[1]:+.3f}  z={bbox_delta[2]:+.3f}"
-                )
-                print(f"  mean|max dist (m): {mean_str}/{max_str}")
-            play_queue.put(
-                (frame_idx,
-                 ctx_ready.name.split('.', 1)[0],
-                 ctx_ready.frame_id,
-                 ctx_ready.src_points.astype(np.float32),
-                 dec_pts_ready.astype(np.float32)))
-            print(f"[CLIENT] Received {resp_name} ({payload_len} bytes)")
-            with context_lock:
-                context_store.pop(stem_key, None)
+            result = pending_decoded.pop(next_play_seq)
+            if result.error:
+                stem_name = result.ctx.name.split('.', 1)[0]
+                print(f"[CLIENT] WARN: skipped frame {stem_name} (seq {result.ctx.seq}): {result.error}")
+            else:
+                if result.points is None:
+                    stem_name = result.ctx.name.split('.', 1)[0]
+                    print(f"[CLIENT] WARN: decoded points missing for {stem_name}, skipping playback")
+                else:
+                    frame_idx += 1
+                    metrics = compute_metrics(result.ctx.src_points, result.points, play_sample)
+                    if print_metrics:
+                        n_src, n_dec, diff, centroid_delta, centroid_norm, bbox_delta, mean_str, max_str = metrics
+                        print(f"[FRAME {frame_idx:04d}] {result.ctx.name.split('.', 1)[0]}")
+                        print(
+                            "  points:  "
+                            f"src={n_src}  dec={n_dec}  diff={diff:+d}"
+                        )
+                        print(
+                            "  centroid diff (m):  "
+                            f"x={centroid_delta[0]:+.3f}  y={centroid_delta[1]:+.3f}  z={centroid_delta[2]:+.3f}  ‖Δ‖={centroid_norm:.3f}"
+                        )
+                        print(
+                            "  bbox size Δ (m):   "
+                            f"x={bbox_delta[0]:+.3f}  y={bbox_delta[1]:+.3f}  z={bbox_delta[2]:+.3f}"
+                        )
+                        print(f"  mean|max dist (m): {mean_str}/{max_str}")
+                    play_queue.put(
+                        (frame_idx,
+                         result.ctx.name.split('.', 1)[0],
+                         result.ctx.frame_id,
+                         result.ctx.src_points.astype(np.float32),
+                         result.points.astype(np.float32)))
+                    print(f"[CLIENT] Received {result.response_name} ({result.payload_len} bytes)")
+            budget.release(result.ctx.seq)
             next_play_seq += 1
+    try:
+        while not stop_event.is_set():
+            try:
+                reply = recv_message(sock)
+            except Exception as exc:
+                if not stop_event.is_set():
+                    error_queue.put(exc)
+                    stop_event.set()
+                return
+            if reply is None:
+                break
+            if reply.kind == MSG_EOF:
+                break
+            if reply.kind == MSG_ERROR:
+                error_text = reply.payload.decode('utf-8', 'ignore') if reply.payload else "Server decode error"
+                stem_raw = reply.name or "frame"
+                stem = Path(stem_raw).stem or stem_raw
+                with context_lock:
+                    ctx = context_store.pop(stem, None)
+                if ctx is None:
+                    print(f"[CLIENT] WARN: missing context for error {stem_raw}")
+                    continue
+                pending_decoded[ctx.seq] = PendingDecodeResult(
+                    ctx=ctx,
+                    response_name=stem_raw,
+                    payload_len=0,
+                    points=None,
+                    error=error_text,
+                )
+                drain_ready_frames()
+                continue
+            if reply.kind != MSG_DATA:
+                print(f"[CLIENT] WARN: unexpected message kind {reply.kind}")
+                continue
+            name = reply.name or "frame"
+            payload = reply.payload
+            stats.add_received(len(payload))
+            out_path = decoded_dir / name
+            try:
+                out_path.write_bytes(payload)
+            except Exception as exc:
+                print(f"[CLIENT] WARN: failed to write {out_path.name}: {exc}")
+            else:
+                decoded_files.add(out_path)
+
+            stem_base = Path(name).stem
+            stem = stem_base.split('.decoded', 1)[0]
+            with context_lock:
+                ctx = context_store.pop(stem, None)
+            if ctx is None:
+                print(f"[CLIENT] WARN: missing context for {name}")
+                continue
+
+            try:
+                dec_pts = load_points_from_bytes(payload)
+            except Exception as exc:
+                pending_decoded[ctx.seq] = PendingDecodeResult(
+                    ctx=ctx,
+                    response_name=name,
+                    payload_len=len(payload),
+                    points=None,
+                    error=f"failed to parse decoded payload: {exc}",
+                )
+                drain_ready_frames()
+                continue
+
+            pending_decoded[ctx.seq] = PendingDecodeResult(
+                ctx=ctx,
+                response_name=name,
+                payload_len=len(payload),
+                points=dec_pts,
+            )
+            drain_ready_frames()
+    finally:
+        for result in pending_decoded.values():
+            budget.release(result.ctx.seq)
+        pending_decoded.clear()
+        with context_lock:
+            for ctx in context_store.values():
+                budget.release(ctx.seq)
+            context_store.clear()
 
 
 def ply_stream_reader(pipe: socket.socket,
                       encode_queue: "queue.Queue[Optional[FrameJob]]",
                       stop_event: threading.Event,
                       error_queue: "queue.Queue[Exception]",
-                      default_frame_id: str) -> None:
+                      default_frame_id: str,
+                      budget: PipelineBudget) -> None:
     seq = 0
     try:
         with pipe, pipe.makefile('rb') as fh:
@@ -520,8 +608,15 @@ def ply_stream_reader(pipe: socket.socket,
                     error_queue.put(exc)
                     stop_event.set()
                     return
-                encode_queue.put(FrameJob(seq=seq, name=name, ply_bytes=bytes(payload),
-                                           src_points=src_pts, frame_id=frame_id))
+                if not budget.reserve(seq, stop_event):
+                    return
+                job = FrameJob(seq=seq, name=name, ply_bytes=bytes(payload),
+                               src_points=src_pts, frame_id=frame_id)
+                try:
+                    encode_queue.put(job)
+                except Exception:
+                    budget.release(seq)
+                    raise
                 seq += 1
     except Exception as exc:
         if not stop_event.is_set():
@@ -607,10 +702,11 @@ def main(argv: Iterable[str] | None = None) -> None:
     stats = StreamingStats()
     stop_event = threading.Event()
     error_queue: "queue.Queue[Exception]" = queue.Queue()
-    encode_queue: "queue.Queue[Optional[FrameJob]]" = queue.Queue(maxsize=max_pending)
+    encode_queue: "queue.Queue[Optional[FrameJob]]" = queue.Queue()
     send_queue: "queue.Queue[Optional[tuple[int, str, Optional[bytes], FrameJob]]]" = queue.Queue()
     context_store: Dict[str, FrameContext] = {}
     context_lock = threading.Lock()
+    budget = PipelineBudget(max_pending)
 
     config_path = resolve_qos_override()
     bag_cmd = ['ros2', 'bag', 'play', str(Path(args.bag).resolve())]
@@ -646,7 +742,7 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     stream_thread = threading.Thread(
         target=ply_stream_reader,
-        args=(stream_parent, encode_queue, stop_event, error_queue, args.play_frame_id),
+        args=(stream_parent, encode_queue, stop_event, error_queue, args.play_frame_id, budget),
         name="ply-stream",
         daemon=True,
     )
@@ -674,14 +770,14 @@ def main(argv: Iterable[str] | None = None) -> None:
             print(f"[CLIENT] Connected to {args.server_host}:{args.server_port}")
             sender_thread = threading.Thread(
                 target=sender_loop,
-                args=(sock, send_queue, stats, stop_event, error_queue, context_store, context_lock),
+                args=(sock, send_queue, stats, stop_event, error_queue, context_store, context_lock, budget),
                 name="sender",
                 daemon=True,
             )
             receiver_thread = threading.Thread(
                 target=receiver_loop,
                 args=(sock, decoded_dir, stats, stop_event, error_queue, context_store, context_lock,
-                      to_play, args.play_sample, decoded_files, args.print_metrics),
+                      to_play, args.play_sample, decoded_files, args.print_metrics, budget),
                 name="receiver",
                 daemon=True,
             )
@@ -710,10 +806,12 @@ def main(argv: Iterable[str] | None = None) -> None:
                 else:
                     while True:
                         try:
-                            encode_queue.get_nowait()
+                            pending_job = encode_queue.get_nowait()
                         except queue.Empty:
                             break
                         else:
+                            if isinstance(pending_job, FrameJob):
+                                budget.release(pending_job.seq)
                             encode_queue.task_done()
                 for _ in encode_threads:
                     encode_queue.put(None)
