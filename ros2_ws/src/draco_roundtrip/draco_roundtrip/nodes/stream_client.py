@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import io
 import os
 import queue
@@ -17,7 +18,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 import rclpy
@@ -34,6 +35,7 @@ from draco_roundtrip.utils import (
     MSG_DATA,
     MSG_EOF,
     MSG_ERROR,
+    create_monitor,
     recv_message,
     send_message,
 )
@@ -154,6 +156,21 @@ def load_points_from_bytes(data: bytes) -> np.ndarray:
     return arr.T.astype(np.float32)
 
 
+_MONITOR = create_monitor("client")
+_DEBUG_PRINT = os.environ.get("DRACO_STREAM_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def monitor_event(event: str, **payload: Any) -> None:
+    """Send telemetry to the local monitor (and optionally stdout)."""
+    _MONITOR.emit(event, **payload)
+    if _DEBUG_PRINT:
+        extras = " ".join(f"{key}={payload[key]}" for key in sorted(payload))
+        print(f"[DEBUG][client:{event}] {extras}", flush=True)
+
+
+atexit.register(_MONITOR.close)
+
+
 def compute_metrics(src_pts: np.ndarray, dec_pts: np.ndarray, sample: int) -> tuple[int, int, int, np.ndarray, float, np.ndarray, str, str]:
     n_src = len(src_pts)
     n_dec = len(dec_pts)
@@ -234,6 +251,7 @@ class PipelineBudget:
             if self._sem.acquire(timeout=0.1):
                 with self._lock:
                     self._active.add(seq)
+                    monitor_event("budget_reserve", seq=seq, active=len(self._active))
                 return True
         return False
 
@@ -242,6 +260,8 @@ class PipelineBudget:
             if seq not in self._active:
                 return
             self._active.remove(seq)
+            remaining = len(self._active)
+            monitor_event("budget_release", seq=seq, active=remaining)
         self._sem.release()
 
 
@@ -340,14 +360,34 @@ def encode_worker(_worker_id: int,
             encode_queue.task_done()
             break
         try:
+            monitor_event(
+                "encode_start",
+                seq=job.seq,
+                name=job.name,
+                encode_queue=encode_queue.qsize(),
+                send_queue=send_queue.qsize(),
+            )
             drc_bytes = encode_ply_bytes(encoder, job.name, job.ply_bytes, work_dir, cl, qp, qg, extra)
             send_queue.put((job.seq, job.name, drc_bytes, job))
+            monitor_event(
+                "encode_done",
+                seq=job.seq,
+                bytes=len(drc_bytes),
+                send_queue=send_queue.qsize(),
+            )
         except Exception as exc:
             print(f"[CLIENT] ENCODE FAIL {job.name}: {exc}")
             if not stop_event.is_set():
                 stop_event.set()
                 error_queue.put(RuntimeError(f"Failed to encode {job.name}: {exc}"))
             send_queue.put((job.seq, job.name, None, job))
+            monitor_event(
+                "encode_fail",
+                seq=job.seq,
+                name=job.name,
+                error=str(exc),
+                send_queue=send_queue.qsize(),
+            )
         finally:
             encode_queue.task_done()
 
@@ -372,10 +412,22 @@ def sender_loop(sock: socket.socket,
                     break
                 seq, name, payload, job = item
                 pending[seq] = (name, payload, job)
+                monitor_event(
+                    "sender_pending",
+                    seq=seq,
+                    pending=len(pending),
+                    next_seq=next_seq,
+                    send_queue=send_queue.qsize(),
+                )
                 while next_seq in pending:
                     pending_name, pending_payload, pending_job = pending.pop(next_seq)
                     if pending_payload is None:
                         budget.release(pending_job.seq)
+                        monitor_event(
+                            "sender_skip",
+                            seq=pending_job.seq,
+                            pending=len(pending),
+                        )
                         next_seq += 1
                         continue
                     message_name = pending_name.replace('.ply', '.drc')
@@ -398,6 +450,11 @@ def sender_loop(sock: socket.socket,
                         )
                     print(f"[CLIENT] Sent {pending_name} ({len(pending_payload)} bytes)")
                     next_seq += 1
+                    monitor_event(
+                        "sender_sent",
+                        seq=pending_job.seq,
+                        pending=len(pending),
+                    )
             finally:
                 send_queue.task_done()
     finally:
@@ -483,6 +540,11 @@ def receiver_loop(sock: socket.socket,
                          result.points.astype(np.float32)))
                     print(f"[CLIENT] Received {result.response_name} ({result.payload_len} bytes)")
             budget.release(result.ctx.seq)
+            monitor_event(
+                "receiver_drain",
+                seq=result.ctx.seq,
+                pending=len(pending_decoded),
+            )
             next_play_seq += 1
     try:
         while not stop_event.is_set():
@@ -512,6 +574,12 @@ def receiver_loop(sock: socket.socket,
                     payload_len=0,
                     points=None,
                     error=error_text,
+                )
+                monitor_event(
+                    "receiver_error",
+                    seq=ctx.seq,
+                    pending=len(pending_decoded),
+                    message=error_text,
                 )
                 drain_ready_frames()
                 continue
@@ -555,6 +623,12 @@ def receiver_loop(sock: socket.socket,
                 response_name=name,
                 payload_len=len(payload),
                 points=dec_pts,
+            )
+            monitor_event(
+                "receiver_data",
+                seq=ctx.seq,
+                pending=len(pending_decoded),
+                payload_bytes=len(payload),
             )
             drain_ready_frames()
     finally:
@@ -618,6 +692,13 @@ def ply_stream_reader(pipe: socket.socket,
                                src_points=src_pts, frame_id=frame_id)
                 try:
                     encode_queue.put(job)
+                    monitor_event(
+                        "reader_enqueued",
+                        seq=seq,
+                        name=name,
+                        payload_bytes=size,
+                        encode_queue=encode_queue.qsize(),
+                    )
                 except Exception:
                     budget.release(seq)
                     raise

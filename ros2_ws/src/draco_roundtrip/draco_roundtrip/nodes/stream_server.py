@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import socket
 import subprocess
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from threading import BoundedSemaphore, Event, Lock, Thread
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from draco_roundtrip.utils import (
     Message,
@@ -22,12 +23,27 @@ from draco_roundtrip.utils import (
     MSG_EOF,
     MSG_ERROR,
     ensure_directory,
+    create_monitor,
     recv_message,
     resolve_executable,
     send_message,
 )
 
 RECV_TIMEOUT_SEC = 0.5
+
+
+_MONITOR = create_monitor("server")
+_DEBUG_PRINT = os.environ.get("DRACO_STREAM_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def monitor_event(event: str, **payload: Any) -> None:
+    _MONITOR.emit(event, **payload)
+    if _DEBUG_PRINT:
+        extras = " ".join(f"{key}={payload[key]}" for key in sorted(payload))
+        print(f"[DEBUG][server:{event}] {extras}", flush=True)
+
+
+atexit.register(_MONITOR.close)
 
 
 def shutdown_socket(sock: Optional[socket.socket]) -> None:
@@ -111,10 +127,29 @@ def main(argv: Optional[list[str]] = None) -> None:
                 decode_queue.task_done()
                 break
             try:
+                monitor_event(
+                    "worker_start",
+                    seq=job.seq,
+                    stem=job.stem,
+                    decode_queue=decode_queue.qsize(),
+                    result_queue=result_queue.qsize(),
+                )
                 ply_bytes = decode_drc(decoder, job.payload, work_dir, job.stem, job.seq)
                 result_queue.put(DecodeResult(seq=job.seq, stem=job.stem, data=ply_bytes, error=None))
+                monitor_event(
+                    "worker_done",
+                    seq=job.seq,
+                    bytes=len(ply_bytes),
+                    result_queue=result_queue.qsize(),
+                )
             except Exception as exc:  # pylint: disable=broad-except
                 result_queue.put(DecodeResult(seq=job.seq, stem=job.stem, data=None, error=str(exc)))
+                monitor_event(
+                    "worker_fail",
+                    seq=job.seq,
+                    stem=job.stem,
+                    error=str(exc),
+                )
             finally:
                 job_slots.release()
                 decode_queue.task_done()
@@ -150,6 +185,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                     result_queue.task_done()
                     break
                 pending[item.seq] = item
+                monitor_event(
+                    "sender_pending",
+                    seq=item.seq,
+                    pending=len(pending),
+                    next_seq=next_seq,
+                    result_queue=result_queue.qsize(),
+                )
                 while next_seq in pending:
                     result = pending.pop(next_seq)
                     if result.error is not None:
@@ -168,6 +210,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                         break
                     next_seq += 1
                     processed += 1
+                    monitor_event(
+                        "sender_sent",
+                        seq=result.seq,
+                        pending=len(pending),
+                        processed=processed,
+                        total_jobs=total_jobs,
+                    )
                 result_queue.task_done()
                 if processed >= total_jobs and decode_queue.empty() and not pending:
                     break
@@ -203,15 +252,38 @@ def main(argv: Optional[list[str]] = None) -> None:
                     with bytes_lock:
                         bytes_in += len(msg.payload)
                     print(f"[SERVER] Received {stem_raw} ({len(msg.payload)} bytes)")
+                    monitor_event(
+                        "recv_message",
+                        seq=seq,
+                        stem=stem,
+                        decode_queue=decode_queue.qsize(),
+                        total_jobs=total_jobs,
+                        payload_bytes=len(msg.payload),
+                    )
                     acquired = False
                     while not stop_event.is_set():
                         if job_slots.acquire(timeout=0.1):
                             acquired = True
+                            monitor_event(
+                                "recv_slot_acquired",
+                                seq=seq,
+                                pending_decode=decode_queue.qsize(),
+                            )
                             break
                     if not acquired:
+                        monitor_event(
+                            "recv_slot_timeout",
+                            seq=seq,
+                            pending_decode=decode_queue.qsize(),
+                        )
                         break
                     try:
                         decode_queue.put(DecodeJob(seq=seq, stem=stem, payload=msg.payload))
+                        monitor_event(
+                            "recv_queued",
+                            seq=seq,
+                            decode_queue=decode_queue.qsize(),
+                        )
                     except Exception:
                         job_slots.release()
                         raise

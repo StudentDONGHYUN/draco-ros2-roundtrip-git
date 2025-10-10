@@ -3,6 +3,7 @@
 from .config import ensure_directory, resolve_qos_override
 from .executable import resolve_executable
 from .metrics import _HAVE_SCIPY, compute_basic_metrics, sample_indices
+from .monitor import MonitorClient, create_monitor
 from .ply_io import (
     _HAVE_O3D,
     collect_matching_pairs,
@@ -47,4 +48,6 @@ __all__ = [
     "MSG_ERROR",
     "send_message",
     "recv_message",
+    "MonitorClient",
+    "create_monitor",
 ]
