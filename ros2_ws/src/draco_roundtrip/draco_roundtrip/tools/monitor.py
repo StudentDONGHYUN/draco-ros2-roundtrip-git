@@ -43,9 +43,11 @@ class TelemetryState:
         self.stall_seconds = stall_seconds
         self._last_event = time.monotonic()
         self._warning_last: Dict[Tuple[str, str], float] = defaultdict(float)
+        self._activity = False
 
     def process_event(self, event: Dict[str, object]) -> None:
         self._last_event = time.monotonic()
+        self._activity = True
         role = str(event.get("role", "unknown"))
         name = str(event.get("event", "unknown"))
         seq = event.get("seq")
@@ -58,6 +60,8 @@ class TelemetryState:
                 stage.updated = self._last_event
 
     def check_stalls(self) -> Iterable[str]:
+        if not self._activity:
+            return ()
         now = time.monotonic()
         for idx in range(len(PIPELINE_FLOW) - 1):
             a_key = PIPELINE_FLOW[idx]
@@ -91,6 +95,9 @@ class TelemetryState:
             seq = "-" if state.seq < 0 else str(state.seq)
             parts.append(f"{role}.{stage}={seq}")
         return " | ".join(parts)
+
+    def has_activity(self) -> bool:
+        return self._activity
 
 
 class MonitorServer:
@@ -158,11 +165,15 @@ class MonitorServer:
     async def _summary_loop(self) -> None:
         while True:
             await asyncio.sleep(self.summary_interval)
+            if not self.state.has_activity():
+                continue
             print(f"[SUMMARY] {self.state.summary_line()}")
 
     async def _stall_loop(self) -> None:
         while True:
             await asyncio.sleep(0.5)
+            if not self.state.has_activity():
+                continue
             for warning in self.state.check_stalls():
                 print(f"[WARN] {warning}")
 

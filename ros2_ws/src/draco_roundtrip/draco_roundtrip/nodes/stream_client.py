@@ -36,6 +36,7 @@ from draco_roundtrip.utils import (
     MSG_EOF,
     MSG_ERROR,
     create_monitor,
+    recommended_worker_count,
     recv_message,
     send_message,
 )
@@ -778,11 +779,23 @@ def main(argv: Iterable[str] | None = None) -> None:
     decoded_dir.mkdir(parents=True, exist_ok=True)
 
     max_pending = max(1, args.max_pending)
-    cpu_count = os.cpu_count() or 1
-    if args.encoder_workers > 0:
-        worker_count = args.encoder_workers
-    else:
-        worker_count = max(1, cpu_count - 1)
+    plan = recommended_worker_count(
+        requested=args.encoder_workers,
+        reserve_ratio=0.2,
+        min_reserve=1,
+        cap=None,
+        env_prefix="DRACO_ENCODER",
+    )
+    worker_count = plan.workers
+    monitor_event(
+        "config_workers",
+        component="encoder",
+        workers=plan.workers,
+        mode=plan.mode,
+        total_cpu=plan.total_cpu,
+        reserved=plan.reserved,
+        cap=plan.cap,
+    )
 
     stats = StreamingStats()
     stop_event = threading.Event()

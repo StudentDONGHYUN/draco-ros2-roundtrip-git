@@ -2,6 +2,7 @@
 
 from .config import ensure_directory, resolve_qos_override
 from .executable import resolve_executable
+from .hardware import WorkerPlan, recommended_worker_count
 from .metrics import _HAVE_SCIPY, compute_basic_metrics, sample_indices
 from .monitor import MonitorClient, create_monitor
 from .ply_io import (
@@ -50,4 +51,6 @@ __all__ = [
     "recv_message",
     "MonitorClient",
     "create_monitor",
+    "WorkerPlan",
+    "recommended_worker_count",
 ]

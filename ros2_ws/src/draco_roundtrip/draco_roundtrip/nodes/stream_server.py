@@ -24,6 +24,7 @@ from draco_roundtrip.utils import (
     MSG_ERROR,
     ensure_directory,
     create_monitor,
+    recommended_worker_count,
     recv_message,
     resolve_executable,
     send_message,
@@ -109,8 +110,23 @@ def main(argv: Optional[list[str]] = None) -> None:
     decoder = resolve_executable('draco_decoder', args.decoder, env_var='DRACO_DECODER')
     work_dir = ensure_directory(Path(args.work_dir).resolve())
 
-    cpu_count = os.cpu_count() or 1
-    worker_count = args.decoder_workers if args.decoder_workers > 0 else max(1, min(4, cpu_count))
+    plan = recommended_worker_count(
+        requested=args.decoder_workers,
+        reserve_ratio=0.2,
+        min_reserve=1,
+        cap=None,
+        env_prefix="DRACO_DECODER",
+    )
+    worker_count = plan.workers
+    monitor_event(
+        "config_workers",
+        component="decoder",
+        workers=plan.workers,
+        mode=plan.mode,
+        total_cpu=plan.total_cpu,
+        reserved=plan.reserved,
+        cap=plan.cap,
+    )
 
     decode_queue: "Queue[Optional[DecodeJob]]" = Queue()
     result_queue: "Queue[Optional[DecodeResult]]" = Queue()
