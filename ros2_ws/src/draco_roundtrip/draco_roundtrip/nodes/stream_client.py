@@ -332,7 +332,8 @@ def encode_worker(_worker_id: int,
                   qp: int,
                   qg: int,
                   extra: list[str],
-                  _stop_event: threading.Event) -> None:
+                  stop_event: threading.Event,
+                  error_queue: "queue.Queue[Exception]") -> None:
     while True:
         job = encode_queue.get()
         if job is None:
@@ -343,6 +344,9 @@ def encode_worker(_worker_id: int,
             send_queue.put((job.seq, job.name, drc_bytes, job))
         except Exception as exc:
             print(f"[CLIENT] ENCODE FAIL {job.name}: {exc}")
+            if not stop_event.is_set():
+                stop_event.set()
+                error_queue.put(RuntimeError(f"Failed to encode {job.name}: {exc}"))
             send_queue.put((job.seq, job.name, None, job))
         finally:
             encode_queue.task_done()
@@ -731,7 +735,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         threading.Thread(
             target=encode_worker,
             args=(idx, encode_queue, send_queue, encoder, work_dir,
-                  args.cl, args.qp, args.qg, args.encoder_extra, stop_event),
+                  args.cl, args.qp, args.qg, args.encoder_extra, stop_event, error_queue),
             name=f"encoder-{idx}",
             daemon=True,
         )

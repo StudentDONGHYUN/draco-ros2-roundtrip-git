@@ -27,6 +27,17 @@ from draco_roundtrip.utils import (
     send_message,
 )
 
+RECV_TIMEOUT_SEC = 0.5
+
+
+def shutdown_socket(sock: Optional[socket.socket]) -> None:
+    if sock is None:
+        return
+    with suppress(Exception):
+        sock.shutdown(socket.SHUT_RDWR)
+    with suppress(Exception):
+        sock.close()
+
 
 @dataclass
 class DecodeJob:
@@ -118,6 +129,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(f"[SERVER] Listening on {args.host}:{args.port}")
         conn, addr = server.accept()
         print(f"[SERVER] Connection from {addr}")
+        conn.settimeout(RECV_TIMEOUT_SEC)
 
         total_jobs = 0
 
@@ -152,6 +164,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     except Exception as exc:  # pylint: disable=broad-except
                         print(f"[SERVER] ERROR sending {result.stem}: {exc}")
                         stop_event.set()
+                        shutdown_socket(conn)
                         break
                     next_seq += 1
                     processed += 1
@@ -166,7 +179,15 @@ def main(argv: Optional[list[str]] = None) -> None:
             seq = 0
             try:
                 while not stop_event.is_set():
-                    msg = recv_message(conn)
+                    try:
+                        msg = recv_message(conn)
+                    except socket.timeout:
+                        continue
+                    except (ConnectionError, OSError) as exc:
+                        if not stop_event.is_set():
+                            print(f"[SERVER] Connection error: {exc}")
+                            stop_event.set()
+                        break
                     if msg is None:
                         print("[SERVER] End of stream")
                         break
@@ -198,6 +219,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     total_jobs += 1
             finally:
                 stop_event.set()
+                shutdown_socket(conn)
                 for _ in workers:
                     decode_queue.put(None)
                 decode_queue.join()
